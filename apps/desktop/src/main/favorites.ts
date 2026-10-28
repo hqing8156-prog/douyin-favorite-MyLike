@@ -133,6 +133,9 @@ export class FavoritesService {
             this.activity = 'requesting'
             this.changed()
             try {
+              console.info(
+                `[Favorites] 请求 ${task.stage}：folder=${task.folderId ?? '-'} cursor=${task.cursor}`
+              )
               const account = await this.identity(task.accountId, guard)
               guard()
               const result = await this.engine.request(
@@ -141,13 +144,15 @@ export class FavoritesService {
                 {
                   cursor: task.cursor,
                   count: '18',
-                  ...(task.folderId ? { collects_id: task.folderId } : {}),
-                  ...(task.stage !== 'all' ? { version_code: '170400', version_name: '17.4.0' } : {})
+                  ...(task.folderId ? { collects_id: task.folderId } : {})
                 }
               )
               guard()
               const page =
                 task.stage === 'folders' ? parseFavoriteFolders(result) : parseFavoritesPage(result)
+              console.info(
+                `[Favorites] 返回 ${task.stage}：folder=${task.folderId ?? '-'} items=${'items' in page ? page.items.length : 0} folders=${'folders' in page ? page.folders.length : 0} hasMore=${page.hasMore} nextCursor=${page.cursor}`
+              )
               const ids =
                 'folders' in page
                   ? page.folders.map((folder) => folder.id)
@@ -171,6 +176,9 @@ export class FavoritesService {
                 requestCursor: task.cursor,
                 ...page
               })
+              console.info(
+                `[Favorites] 已保存 ${task.stage}：folder=${task.folderId ?? '-'} items=${'items' in page ? page.items.length : 0} folders=${'folders' in page ? page.folders.length : 0}`
+              )
               this.changed(true)
               return saved
             } finally {
@@ -191,6 +199,9 @@ export class FavoritesService {
       } catch (error) {
         if (signal.aborted) return
         const detail = publicError(error)
+        console.error(
+          `[Favorites] 失败 ${task.stage}：folder=${task.folderId ?? '-'} cursor=${task.cursor} code=${detail.code} message=${detail.message}`
+        )
         ending.reset()
         if (retryableRead(detail.code) && retries < 2) {
           this.activity = ['EMPTY_PAGE', 'EMPTY_RESPONSE'].includes(detail.code) ? 'cooling' : 'waiting'

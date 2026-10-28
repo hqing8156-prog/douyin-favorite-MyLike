@@ -315,12 +315,14 @@ export function Player({
   const openFavorite = () => {
     if (unlikeBusy || favoriteOpen) return
     if (collected) {
-      pause()
       unlike('favorites')
       return
     }
     if (queue.source && queue.source !== 'likes') return
-    pause()
+    setFavoriteOpen(true)
+  }
+  const openFavoriteFolders = () => {
+    if (unlikeBusy || favoriteOpen || !collected) return
     setFavoriteOpen(true)
   }
   const retryMedia = () => {
@@ -374,6 +376,7 @@ export function Player({
       mute: toggleMute,
       original: openOriginal,
       favorite: openFavorite,
+      favoriteFolders: openFavoriteFolders,
       unlike: () => {
         if ((!queue.source || queue.source === 'likes') && !unlikeBusy) {
           pause()
@@ -770,6 +773,10 @@ export function Player({
                 )}
                 disabled={unlikeBusy || (!!queue.source && queue.source !== 'likes' && !collected)}
                 onClick={openFavorite}
+                onContextMenu={(event) => {
+                  event.preventDefault()
+                  openFavoriteFolders()
+                }}
               >
                 <Star size={19} fill="currentColor" />
               </button>

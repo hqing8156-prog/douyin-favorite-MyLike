@@ -38,7 +38,7 @@ type Props = {
   operationError: string
   clearError: () => void
   login: () => void
-  unlike: () => void
+  unlike: (source?: 'likes' | 'favorites') => void
   unlikeBusy: boolean
   libraryRevision: number
   queueOpen: boolean
@@ -314,11 +314,9 @@ export function Player({
   }
   const openFavorite = () => {
     if (unlikeBusy || favoriteOpen) return
-    if (queue.source === 'favorites') {
-      if (collected) {
-        pause()
-        unlike()
-      }
+    if (collected) {
+      pause()
+      unlike('favorites')
       return
     }
     if (queue.source && queue.source !== 'likes') return
@@ -764,19 +762,13 @@ export function Player({
             {(!queue.source || queue.source === 'likes' || queue.source === 'favorites') && (
               <button
                 className={`favorite-control${collected ? ' is-collected' : ''}`}
-                aria-label={queue.source === 'favorites' ? '取消当前收藏' : '收藏当前作品'}
+                aria-label={collected ? '取消当前收藏' : '收藏当前作品'}
                 aria-pressed={collected}
                 title={hint(
                   'favorite',
-                  queue.source === 'favorites'
-                    ? collected
-                      ? '取消当前收藏（需确认）'
-                      : '已取消收藏'
-                    : collected
-                      ? '已收藏，添加至收藏夹'
-                      : '收藏 / 选择收藏夹'
+                  collected ? '取消当前收藏（需确认）' : '收藏 / 选择收藏夹'
                 )}
-                disabled={unlikeBusy || (queue.source === 'favorites' && !collected)}
+                disabled={unlikeBusy || (!!queue.source && queue.source !== 'likes' && !collected)}
                 onClick={openFavorite}
               >
                 <Star size={19} fill="currentColor" />

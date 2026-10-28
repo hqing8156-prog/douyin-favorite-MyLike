@@ -467,13 +467,13 @@ export function App() {
             login={login}
             unlikeBusy={!!operation || unliking}
             libraryRevision={snapshot?.libraryRevision ?? 0}
-            unlike={() => {
+            unlike={(source) => {
               setError('')
               if (playback.view)
                 setUnlikeTarget({
                   accountId: playback.view.queue.accountId,
                   ids: [playback.view.queue.work.id],
-                  source: playback.view.queue.source === 'favorites' ? 'favorites' : 'likes',
+                  source: source ?? (playback.view.queue.source === 'favorites' ? 'favorites' : 'likes'),
                   mode: 'single'
                 })
             }}

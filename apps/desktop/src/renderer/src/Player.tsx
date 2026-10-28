@@ -773,6 +773,12 @@ export function Player({
                 )}
                 disabled={unlikeBusy || (!!queue.source && queue.source !== 'likes' && !collected)}
                 onClick={openFavorite}
+                onMouseDown={(event) => {
+                  if (event.button !== 2) return
+                  event.preventDefault()
+                  event.stopPropagation()
+                  openFavoriteFolders()
+                }}
                 onContextMenu={(event) => {
                   event.preventDefault()
                   event.stopPropagation()

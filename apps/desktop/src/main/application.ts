@@ -24,6 +24,7 @@ import { DataMaintenance } from './data-maintenance'
 import { UnlikeService } from './unlike'
 import { metadataBytes } from './storage/usage'
 import { runtimeEventCategory, type RuntimeEventInput } from '../shared/runtime-events'
+import { AiClassifier } from './ai-classifier'
 
 export class Application {
   private playerVisible = false
@@ -45,6 +46,7 @@ export class Application {
   private readonly lane = new RequestLane()
   private readonly favorites: FavoritesService
   private readonly favoriteActions: FavoriteActions
+  private readonly aiClassifier: AiClassifier
   private readonly collection: CollectionService
   private readonly unlike: UnlikeService
   private readonly authentication: Authentication
@@ -103,6 +105,16 @@ export class Application {
       }
     )
     this.favoriteActions = new FavoriteActions(
+      database,
+      engine,
+      this.run.bind(this),
+      this.identity.bind(this),
+      () => {
+        this.libraryRevision++
+        changed()
+      }
+    )
+    this.aiClassifier = new AiClassifier(
       database,
       engine,
       this.run.bind(this),
@@ -312,7 +324,8 @@ export class Application {
         'collectPage',
         'favoriteEditor',
         'favoriteSave',
-        'favoriteCreateFolder'
+        'favoriteCreateFolder',
+        'aiClassifyFavorites'
       ].includes(command) ||
       (['collectionControl', 'favoritesControl', 'unlikeControl'].includes(command) &&
         input.action === 'resume')
@@ -349,6 +362,7 @@ export class Application {
         'favoriteEditor',
         'favoriteSave',
         'favoriteCreateFolder',
+        'aiClassifyFavorites',
         'unlikeVerify'
       ].includes(command)
     )
@@ -529,6 +543,12 @@ export class Application {
         await this.active(input.accountId)
         await this.favorites.pause()
         return this.favoriteActions.createFolder(input.accountId, input.token, input.name, input.private)
+      case 'aiClassifyFavorites':
+        await this.active(input.accountId)
+        await this.favorites.pause()
+        return this.aiClassifier.runClassification(input.accountId)
+      case 'aiTestConnection':
+        return this.aiClassifier.testConnection(input.provider)
       case 'favoritesStart':
         return this.exclusive(async () => {
           await this.active(input.accountId)

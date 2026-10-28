@@ -75,6 +75,8 @@ export const commands = {
     name: z.string().trim().min(1).max(30),
     private: z.boolean()
   }),
+  aiClassifyFavorites: z.object({ accountId: idSchema }),
+  aiTestConnection: z.object({ provider: z.enum(['deepseek', 'siliconflow']) }),
   collectionControl: z.object({
     accountId: idSchema,
     taskId: idSchema,
@@ -364,6 +366,8 @@ export interface Outputs {
   favoriteEditor: FavoriteEditor
   favoriteSave: { collected: true; foldersAdded: number }
   favoriteCreateFolder: FavoriteFolder
+  aiClassifyFavorites: { classified: number; failed: number; foldersCreated: number; foldersUsed: number }
+  aiTestConnection: null
   snapshot: Snapshot
   createAccount: Account
   switchAccount: null

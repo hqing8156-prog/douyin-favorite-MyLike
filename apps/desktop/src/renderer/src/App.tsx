@@ -359,6 +359,7 @@ export function App() {
             error={favoriteFolders.error}
             folderId={folderId}
             setFolderId={setFolderId}
+            notice={setNotice}
           />
         )}
         {(tab === 'library' || tab === 'favorites') && (

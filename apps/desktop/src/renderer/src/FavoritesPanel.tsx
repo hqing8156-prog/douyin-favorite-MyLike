@@ -1,5 +1,5 @@
 import { useEffect, useState } from 'react'
-import { Pause, Square, RefreshCw } from 'lucide-react'
+import { Pause, Square, RefreshCw, Sparkles } from 'lucide-react'
 import type { FavoriteFolder, FavoritesTask } from '../../shared/contracts'
 import { call, type Perform } from './api'
 import { Select } from './Select'
@@ -39,7 +39,8 @@ export function FavoritesPanel({
   folderId,
   setFolderId,
   error,
-  compact = false
+  compact = false,
+  notice
 }: {
   accountId: string | null
   task: FavoritesTask | null
@@ -51,6 +52,7 @@ export function FavoritesPanel({
   setFolderId?: (id: string | null) => void
   error?: string
   compact?: boolean
+  notice?: (message: string) => void
 }) {
   const running = task?.status === 'running'
   const control = (action: 'pause' | 'resume' | 'stop') =>
@@ -105,6 +107,21 @@ export function FavoritesPanel({
             {task && task.status !== 'completed' ? '继续同步收藏' : '同步收藏'}
           </button>
         )}
+        <button
+          disabled={!accountId || busy}
+          onClick={() =>
+            void perform('AI 自动整理收藏', async () => {
+              const result = await call(window.mylike.invoke('aiClassifyFavorites', { accountId: accountId! }))
+              notice?.(
+                `AI 分类完成：成功 ${result.classified} 条，失败 ${result.failed} 条，创建 ${result.foldersCreated} 个收藏夹，使用 ${result.foldersUsed} 个收藏夹。`
+              )
+            })
+          }
+          title="使用语音转文字和 DeepSeek 自动分类默认收藏"
+        >
+          <Sparkles size={14} />
+          AI 自动分类
+        </button>
         {task && task.status !== 'completed' && task.status !== 'stopped' && (
           <button disabled={busy && !running} onClick={() => control('stop')}>
             <Square size={14} />

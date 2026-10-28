@@ -769,12 +769,13 @@ export function Player({
                 aria-pressed={collected}
                 title={hint(
                   'favorite',
-                  collected ? '取消当前收藏（需确认）' : '收藏 / 选择收藏夹'
+                  collected ? '左键取消当前收藏，右键选择收藏夹' : '左键收藏，右键选择收藏夹'
                 )}
                 disabled={unlikeBusy || (!!queue.source && queue.source !== 'likes' && !collected)}
                 onClick={openFavorite}
                 onContextMenu={(event) => {
                   event.preventDefault()
+                  event.stopPropagation()
                   openFavoriteFolders()
                 }}
               >

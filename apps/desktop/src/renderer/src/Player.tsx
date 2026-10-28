@@ -322,7 +322,7 @@ export function Player({
     setFavoriteOpen(true)
   }
   const openFavoriteFolders = () => {
-    if (unlikeBusy || favoriteOpen || !collected) return
+    if (unlikeBusy || favoriteOpen) return
     setFavoriteOpen(true)
   }
   const retryMedia = () => {

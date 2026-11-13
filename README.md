@@ -8,6 +8,8 @@
 
 一个回看抖音喜欢与收藏的 Windows 桌面应用。
 
+在上游原版基础上，本仓库新增了 AI 自动分类、收藏夹写回云端与本地收藏夹管理。
+
 [![Release](https://img.shields.io/github/v/release/hqing8156-prog/douyin-favorite-MyLike?style=flat-square&color=ff5c8a)](https://github.com/hqing8156-prog/douyin-favorite-MyLike/releases/latest)
 [![Windows x64](https://img.shields.io/badge/Windows-x64-5865f2?style=flat-square)](https://github.com/hqing8156-prog/douyin-favorite-MyLike/releases/latest)
 [![Build](https://github.com/hqing8156-prog/douyin-favorite-MyLike/actions/workflows/desktop.yml/badge.svg?branch=main)](https://github.com/hqing8156-prog/douyin-favorite-MyLike/actions/workflows/desktop.yml)
@@ -53,6 +55,20 @@ v2.0.4 与 v2.0.3 的本地数据兼容。升级前请退出旧版，再使用�
 - **边采边看**：后台采集或取消点赞、收藏时继续播放，任务进度和异常集中管理，统一核验登录、喜欢与收藏状态。
 - **本地管理**：多账号隔离、账号改名与删除、批量整理与关键操作自动备份。
 - **按你的习惯**：深浅主题、界面缩放、窗口记忆、播放偏好与内容仪表盘。
+
+## 相比上游的改动
+
+本仓库是[上游项目](https://github.com/Hannah2227/douyin-favorite-MyLike)的延续分支，版本号独立维护。在原版已有能力之外，主要新增了以下功能：
+
+| 能力 | 说明 |
+| --- | --- |
+| **AI 自动分类** | 接入 DeepSeek / 硅基流动，结合作品文案与语音转文字自动归类；分类前实时核实远端收藏夹，同名收藏夹复用，同一作品可归入多个收藏夹 |
+| **收藏夹写回云端** | 本地整理好的收藏夹可一键写回抖音；弹窗只列出数量不一致或仍有待写回改动的收藏夹，只处理所选范围，核对并补写云端缺少的作品，不可见作品跳过并在结果中统计 |
+| **本地收藏夹管理** | 新建、改名、删除本地创建的收藏夹；改名只影响本机，删除已写回的夹只在本机隐藏，不会删除云端收藏夹 |
+| **作者名快捷操作** | 播放页左键作者名打开主页，右键复制作者名称 |
+| **诊断日志** | 分类、收藏与同步的请求和结果写入日志文件，便于定位问题 |
+
+播放器内嵌评论与回复、喜欢与收藏采集等能力与上游保持一致。
 
 ## 快速上手
 

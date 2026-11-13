@@ -8,16 +8,16 @@
 
 一个回看抖音喜欢与收藏的 Windows 桌面应用。
 
-[![Release](https://img.shields.io/github/v/release/Hannah2227/douyin-favorite-MyLike?style=flat-square&color=ff5c8a)](https://github.com/Hannah2227/douyin-favorite-MyLike/releases/latest)
-[![Windows x64](https://img.shields.io/badge/Windows-x64-5865f2?style=flat-square)](https://github.com/Hannah2227/douyin-favorite-MyLike/releases/latest)
-[![Build](https://github.com/Hannah2227/douyin-favorite-MyLike/actions/workflows/desktop.yml/badge.svg?branch=main)](https://github.com/Hannah2227/douyin-favorite-MyLike/actions/workflows/desktop.yml)
+[![Release](https://img.shields.io/github/v/release/hqing8156-prog/douyin-favorite-MyLike?style=flat-square&color=ff5c8a)](https://github.com/hqing8156-prog/douyin-favorite-MyLike/releases/latest)
+[![Windows x64](https://img.shields.io/badge/Windows-x64-5865f2?style=flat-square)](https://github.com/hqing8156-prog/douyin-favorite-MyLike/releases/latest)
+[![Build](https://github.com/hqing8156-prog/douyin-favorite-MyLike/actions/workflows/desktop.yml/badge.svg?branch=main)](https://github.com/hqing8156-prog/douyin-favorite-MyLike/actions/workflows/desktop.yml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-6bb99b?style=flat-square)](LICENSE)
 
-[![Stars](https://img.shields.io/github/stars/Hannah2227/douyin-favorite-MyLike?style=flat-square&logo=github&label=Stars&color=f5c451)](https://github.com/Hannah2227/douyin-favorite-MyLike/stargazers)
-[![Forks](https://img.shields.io/github/forks/Hannah2227/douyin-favorite-MyLike?style=flat-square&label=Forks&color=8ba6fa)](https://github.com/Hannah2227/douyin-favorite-MyLike/forks)
-[![Downloads](https://img.shields.io/github/downloads/Hannah2227/douyin-favorite-MyLike/total?style=flat-square&label=Downloads&color=ff5c8a)](https://github.com/Hannah2227/douyin-favorite-MyLike/releases)
+[![Stars](https://img.shields.io/github/stars/hqing8156-prog/douyin-favorite-MyLike?style=flat-square&logo=github&label=Stars&color=f5c451)](https://github.com/hqing8156-prog/douyin-favorite-MyLike/stargazers)
+[![Forks](https://img.shields.io/github/forks/hqing8156-prog/douyin-favorite-MyLike?style=flat-square&label=Forks&color=8ba6fa)](https://github.com/hqing8156-prog/douyin-favorite-MyLike/forks)
+[![Downloads](https://img.shields.io/github/downloads/hqing8156-prog/douyin-favorite-MyLike/total?style=flat-square&label=Downloads&color=ff5c8a)](https://github.com/hqing8156-prog/douyin-favorite-MyLike/releases)
 
-[下载应用](https://github.com/Hannah2227/douyin-favorite-MyLike/releases/latest) · [功能特性](#功能特性) · [界面预览](#界面预览) · [反馈问题](https://github.com/Hannah2227/douyin-favorite-MyLike/issues)
+[下载应用](https://github.com/hqing8156-prog/douyin-favorite-MyLike/releases/latest) · [功能特性](#功能特性) · [界面预览](#界面预览) · [反馈问题](https://github.com/hqing8156-prog/douyin-favorite-MyLike/issues)
 
 </div>
 
@@ -33,13 +33,15 @@
 
 ## 下载
 
-**[下载最新版 · Windows x64](https://github.com/Hannah2227/douyin-favorite-MyLike/releases/latest)**
+**[下载最新版 · Windows x64](https://github.com/hqing8156-prog/douyin-favorite-MyLike/releases/latest)**
 
 在发布页下载文件名以 `portable.exe` 结尾的应用，保存到固定文件夹后双击运行，免安装使用。
 
 macOS（社区版本）：请前往[贡献者维护的仓库](https://github.com/billybobz-design/douyin-favorite-MyLike)下载，相关问题请在该仓库反馈。
 
-v2.0.3 与 v2.0.2 的本地数据兼容。升级前请退出旧版，再使用新版 EXE；旧 WPF 版的数据与登录态不迁移，首次使用新版需重新登录和采集。
+v2.0.4 与 v2.0.3 的本地数据兼容。升级前请退出旧版，再使用新版 EXE；旧 WPF 版的数据与登录态不迁移，首次使用新版需重新登录和采集。
+
+本仓库为持续维护的分支，下载、更新与问题反馈请以本仓库的发布页和 Issues 为准。
 
 ## 功能特性
 

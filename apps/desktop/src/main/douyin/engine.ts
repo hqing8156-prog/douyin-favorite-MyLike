@@ -422,16 +422,19 @@ export class DouyinEngine {
       timeoutMs = 12_000
     let win: BrowserWindow | null = null
     let timer: ReturnType<typeof setTimeout> | undefined
+    let rejectCancelled!: (reason: AppError) => void
     const cancelled = new Promise<never>((_resolve, reject) => {
-      this.cancelRequest = (reason = new AppError('CANCELLED', '请求已停止，未推进采集断点。')) => {
-        if (win && !win.isDestroyed())
-          void this.executeInPage(
-            win,
-            `globalThis.__mylikeRequests?.get(${serializeForScript(id)})?.abort()`
-          ).catch(() => {})
-        reject(reason)
-      }
+      rejectCancelled = reject
     })
+    const cancel = (reason = new AppError('CANCELLED', '请求已停止，未推进采集断点。')): void => {
+      if (win && !win.isDestroyed())
+        void this.executeInPage(
+          win,
+          `globalThis.__mylikeRequests?.get(${serializeForScript(id)})?.abort()`
+        ).catch(() => {})
+      rejectCancelled(reason)
+    }
+    this.cancelRequest = cancel
     let generation: number | null = null
     try {
       win = await Promise.race([ready, cancelled])
@@ -459,22 +462,29 @@ export class DouyinEngine {
       generation = this.generation
       this.requestGeneration = generation
       this.operation = operation
+      let rejectTimedOut!: (reason: AppError) => void
+      const timedOut = new Promise<never>((_resolve, reject) => {
+        rejectTimedOut = reject
+      })
       timer = setTimeout(() => {
-        this.cancelRequest?.(
-          new AppError(
-            'TIMEOUT',
-            operation === 'self'
-              ? '登录核验超时：抖音身份接口在 12 秒内没有响应，请确认已登录、完成验证并检查网络。'
-              : '接口响应超时，请检查登录、网络或人工验证。'
-          )
+        const error = new AppError(
+          'TIMEOUT',
+          operation === 'self'
+            ? '登录核验超时：抖音身份接口在 12 秒内没有响应，请确认已登录、完成验证并检查网络。'
+            : '接口响应超时，请检查登录、网络或人工验证。'
         )
+        // Rejecting a local promise guarantees this request settles even if a
+        // concurrent request has already replaced the shared cancelRequest.
+        cancel(error)
+        rejectTimedOut(error)
       }, timeoutMs + 1500)
       const reply = await Promise.race([
         this.executeInPage<PageReply>(
           win,
           buildPageScript({ id, operation, parameters, timeout: timeoutMs })
         ),
-        cancelled
+        cancelled,
+        timedOut
       ])
       if (this.window !== win || this.accountId !== accountId)
         throw new AppError('CANCELLED', '页面或账号已变化，旧响应已丢弃。')

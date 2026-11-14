@@ -21,6 +21,7 @@ import { Dashboard } from './Dashboard'
 import { useOverview } from './useOverview'
 import { HelpPage } from './HelpPage'
 import { AiClassifyDialog, type AiClassificationSource } from './AiClassifyDialog'
+import { MoveToFolderDialog } from './MoveToFolderDialog'
 
 export function App() {
   const [snapshot, setSnapshot] = useState<Snapshot | null>(null)
@@ -37,6 +38,11 @@ export function App() {
   const [name, setName] = useState('')
   const [diagnostics, setDiagnostics] = useState<Diagnostics | null>(null)
   const [deleteTarget, setDeleteTarget] = useState<{ accountId: string; ids: string[] } | null>(null)
+  const [moveTarget, setMoveTarget] = useState<{
+    accountId: string
+    fromFolderId: string
+    ids: string[]
+  } | null>(null)
   const [unlikeTarget, setUnlikeTarget] = useState<{
     accountId: string
     ids: string[]
@@ -74,6 +80,9 @@ export function App() {
   useEffect(() => {
     setFolderId(null)
   }, [accountId])
+  useEffect(() => {
+    setMoveTarget(null)
+  }, [accountId, folderId])
   useEffect(() => {
     if (
       favoriteFolders.loaded &&
@@ -440,6 +449,19 @@ export function App() {
               if (accountId) setDeleteTarget({ accountId, ids: [...library.selection.ids] })
             }}
             folderId={folderId}
+            moveToFolder={
+              folderId && favoriteFolders.folders.some((folder) => folder.id !== folderId)
+                ? () => {
+                    if (!accountId || !folderId || !library.selection.ids.size) return
+                    setError('')
+                    setMoveTarget({
+                      accountId,
+                      fromFolderId: folderId,
+                      ids: [...library.selection.ids]
+                    })
+                  }
+                : undefined
+            }
             removeFromFolder={() => {
               if (!accountId || !folderId || !library.selection.ids.size) return
               const ids = [...library.selection.ids]
@@ -474,6 +496,8 @@ export function App() {
             stopTextScan={stopTextScan}
             perform={perform}
             openClassification={openClassification}
+            folders={favoriteFolders.folders}
+            foldersLoaded={favoriteFolders.loaded}
           />
         )}
         {tab === 'settings' && (
@@ -516,6 +540,7 @@ export function App() {
             copyAuthor={copyAuthor}
             unlikeBusy={!!operation || unliking}
             libraryRevision={snapshot?.libraryRevision ?? 0}
+            cloudSyncEnabled={snapshot?.appPreferences.syncFavoritesToCloud ?? false}
             unlike={(source) => {
               setError('')
               if (playback.view)
@@ -581,6 +606,38 @@ export function App() {
             </p>
           )}
         </ConfirmDialog>
+      )}
+      {moveTarget && (
+        <MoveToFolderDialog
+          accountId={moveTarget.accountId}
+          workIds={moveTarget.ids}
+          folders={favoriteFolders.folders}
+          currentFolderId={moveTarget.fromFolderId}
+          workCount={moveTarget.ids.length}
+          cloudSync={snapshot?.appPreferences.syncFavoritesToCloud ?? false}
+          busy={!!operation}
+          error={error}
+          cancel={() => setMoveTarget(null)}
+          confirm={(toFolderId) =>
+            perform('移动收藏夹内容', async () => {
+              const result = await call(
+                window.mylike.invoke('favoriteFolderMoveWorks', {
+                  accountId: moveTarget.accountId,
+                  fromFolderId: moveTarget.fromFolderId,
+                  toFolderId,
+                  workIds: moveTarget.ids
+                })
+              )
+              favoritesLibrary.selection.clear()
+              setMoveTarget(null)
+              setNotice(
+                result.cloudSync
+                  ? `已把 ${result.moved} 条作品从“${result.fromFolderTitle}”移到“${result.toFolderTitle}”。`
+                  : `云端写回已关闭：已在本机把 ${result.moved} 条作品从“${result.fromFolderTitle}”移到“${result.toFolderTitle}”，抖音云端收藏夹未改动。`
+              )
+            })
+          }
+        />
       )}
       {deleteTarget && (
         <ConfirmDialog

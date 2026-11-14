@@ -12,7 +12,8 @@ import {
   CheckSquare,
   Trash2,
   Shuffle,
-  FileText
+  FileText,
+  FolderInput
 } from 'lucide-react'
 import { MAX_BATCH_SIZE, type Account, type Work, type QueueState } from '../../shared/contracts'
 import type { Library } from './useLibrary'
@@ -35,6 +36,7 @@ type Props = {
   unlike: () => void
   folderId?: string | null
   removeFromFolder?: () => void
+  moveToFolder?: () => void
   copyAuthor: (author: string) => void
   openAuthor: (authorId: string | null, author: string, workId: string, accountId: string | null) => void
   playRange: (mode: 'sequence' | 'shuffle') => void
@@ -58,6 +60,7 @@ export function LibraryView({
   unlike,
   folderId,
   removeFromFolder,
+  moveToFolder,
   copyAuthor,
   openAuthor,
   playRange,
@@ -189,6 +192,16 @@ export function LibraryView({
               title="从当前筛选的收藏夹中移出所选作品，保留默认收藏"
             >
               从收藏夹中移除
+            </button>
+          )}
+          {readOnly && folderId && moveToFolder && (
+            <button
+              disabled={!selection.ids.size || selection.ids.size > MAX_BATCH_SIZE || mutationBusy}
+              onClick={moveToFolder}
+              title="从当前收藏夹移出所选作品，并加入另一个收藏夹"
+            >
+              <FolderInput size={14} />
+              移动到其他收藏夹
             </button>
           )}
           {pendingChanges && <span>内容有更新，清空选择后刷新。</span>}

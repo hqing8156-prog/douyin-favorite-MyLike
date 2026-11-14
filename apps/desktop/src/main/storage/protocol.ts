@@ -16,7 +16,8 @@ import type {
   PlaybackPreferences,
   Outputs,
   UnlikeTask,
-  UnlikeItem
+  UnlikeItem,
+  PendingFavoriteWrite
 } from '../../shared/contracts'
 import type { FavoritesPage } from './favorites'
 import type { AppPreferences, WindowState } from '../../shared/preferences'
@@ -72,7 +73,11 @@ export interface Inputs {
     workId?: string
   }
   favoriteWritePending: { accountId: string }
+  favoriteWritebackPending: { accountId: string }
   favoriteFolderWorkIds: { accountId: string; folderId: string }
+  favoriteFolderUnsyncedWorkIds: { accountId: string; folderId: string }
+  favoriteFolderMemberships: { accountId: string; workIds: string[] }
+  favoriteFolderWorks: { accountId: string; folderId: string }
   favoriteStageLocalFolders: {
     accountId: string
     remoteId: string
@@ -228,7 +233,11 @@ export interface Replies {
   favoriteLocalFolderDelete: { folderId: string; title: string; localCount: number }
   favoriteQueueWrite: null
   favoriteWritePending: number
+  favoriteWritebackPending: { total: number; items: PendingFavoriteWrite[] }
   favoriteFolderWorkIds: string[]
+  favoriteFolderUnsyncedWorkIds: string[]
+  favoriteFolderMemberships: { folderId: string; count: number }[]
+  favoriteFolderWorks: Work[]
   favoriteStageLocalFolders: number
   favoriteWriteOps: {
     id: number

@@ -6,6 +6,10 @@ import { appPreferencesPatchSchema, playbackPreferencesSchema, type AppPreferenc
 export { playbackPreferencesSchema, shortcutKeys } from './preferences'
 
 export const MAX_BATCH_SIZE = 1000
+/** Keeps one writeback run short enough to review and to limit continuous writes. */
+export const WRITEBACK_BATCH_LIMIT = 100
+/** Reuse one cloud reconciliation across consecutive writeback batches. */
+export const WRITEBACK_SESSION_TTL_MS = 30 * 60_000
 export const idSchema = z.string().uuid()
 export const workIdSchema = z.string().regex(/^\d{1,30}$/)
 /** Folder ids are remote numeric ids or locally generated `local-<uuid>` ids. */
@@ -44,6 +48,14 @@ const queueSourceSchema = z.discriminatedUnion('type', [
   })
 ])
 
+const favoriteWritebackSchema = z
+  .object({
+    accountId: idSchema,
+    folderIds: z.array(z.string().min(1).max(100)).max(1000).default([]),
+    includeDefault: z.boolean().default(false)
+  })
+  .refine((input) => input.includeDefault || input.folderIds.length > 0)
+
 export const commands = {
   snapshot: z.object({}),
   checkHealth: z.object({ accountId: idSchema }),
@@ -77,18 +89,28 @@ export const commands = {
   }),
   favoriteFolders: z.object({ accountId: idSchema }),
   favoriteFoldersRefresh: z.object({ accountId: idSchema }),
-  favoriteSyncToCloud: z
-    .object({
-      accountId: idSchema,
-      folderIds: z.array(z.string().min(1).max(100)).max(1000).default([]),
-      includeDefault: z.boolean().default(false)
-    })
-    .refine((input) => input.includeDefault || input.folderIds.length > 0),
+  favoriteFolderMemberships: z.object({
+    accountId: idSchema,
+    workIds: z.array(workIdSchema).min(1).max(MAX_BATCH_SIZE)
+  }),
+  favoriteSyncToCloud: favoriteWritebackSchema,
+  favoriteSyncAutoStart: favoriteWritebackSchema,
+  favoriteWritebackPending: z.object({ accountId: idSchema }),
+  favoriteSyncStop: z.object({}),
+  favoriteFolderDiff: z.object({ accountId: idSchema, folderId: folderIdSchema }),
   favoriteFolderRemoveWorks: z.object({
     accountId: idSchema,
     folderId: folderIdSchema,
     workIds: z.array(workIdSchema).min(1).max(MAX_BATCH_SIZE)
   }),
+  favoriteFolderMoveWorks: z
+    .object({
+      accountId: idSchema,
+      fromFolderId: folderIdSchema,
+      toFolderId: folderIdSchema,
+      workIds: z.array(workIdSchema).min(1).max(MAX_BATCH_SIZE)
+    })
+    .refine((input) => input.fromFolderId !== input.toFolderId),
   favoriteFolderCreateLocal: z.object({
     accountId: idSchema,
     title: z.string().trim().min(1).max(30),
@@ -213,6 +235,7 @@ export const commands = {
   backup: z.object({}),
   dataInfo: z.object({ accountId: idSchema.nullable() }),
   openDataFolder: z.object({ target: z.enum(['data', 'backups', 'logs']) }),
+  pickCoverCacheDirectory: z.object({}),
   clearCache: z.object({ accountId: idSchema }),
   media: z.object({
     accountId: idSchema,
@@ -367,6 +390,31 @@ export interface AiClassificationResult {
   unmatched: number
   folderCounts: { title: string; count: number }[]
 }
+export interface FavoriteSyncLast {
+  status: 'completed' | 'stopped' | 'failed'
+  message: string | null
+  at: number
+}
+export interface FavoriteSyncProgress {
+  phase: 'checking' | 'writing' | 'waiting'
+  /** Operations completed in the current batch. */
+  current: number
+  /** Operations in the current batch (0 while the cloud folder is being checked). */
+  total: number
+  /** Pending operations across the account. */
+  remaining: number
+  /** Operations still queued for the current writeback scope. */
+  scopeRemaining: number
+  startedAt: number
+  /** Set while waiting for the next batch. */
+  nextBatchAt: number | null
+  /** Estimated completion time, or null when auto-continue is off. */
+  estimatedFinishAt: number | null
+  autoContinue: boolean
+  batchIntervalSec: number
+  /** 1-based batch number of the current run. */
+  batch: number
+}
 export interface Snapshot {
   aiClassification: AiClassificationProgress | null
   /** AI assignments saved but not yet applied locally, per source. */
@@ -379,6 +427,8 @@ export interface Snapshot {
     startedAt: number
   } | null
   favoriteWritePending: number
+  favoriteSync: FavoriteSyncProgress | null
+  favoriteSyncLast: FavoriteSyncLast | null
   health?: HealthSnapshot | null
   recovery?: RecoveryState[]
   accessChecks?: { accountId: string; operation: string; at: number }[]
@@ -440,6 +490,36 @@ export interface FavoriteFolder {
   private?: boolean
   coverUrl?: string | null
 }
+export interface PendingFavoriteWrite {
+  kind: 'favorite-add' | 'folder-add' | 'folder-remove' | 'folder-create'
+  folderId: string | null
+  folderTitle: string | null
+  workId: string | null
+  workTitle: string | null
+  author: string | null
+  coverUrl: string | null
+  /** Already in favorite_write_ops; false means it will be staged during writeback. */
+  queued: boolean
+}
+/** Read-only comparison between a local favorite folder and its cloud copy. */
+export interface FavoriteFolderDiff {
+  folderId: string
+  title: string
+  localOnly: boolean
+  /** False when some cloud items could not be read, so the comparison is partial. */
+  complete: boolean
+  /** Cloud rows that could not be parsed; they are excluded from both sides. */
+  skipped: number
+  localCount: number
+  remoteCount: number
+  /** Local works the cloud folder lacks; an explicit writeback adds them. */
+  add: Work[]
+  /** Cloud works missing locally; writeback never deletes them. */
+  remoteOnly: Work[]
+  /** True when a list was capped for the IPC payload; counts stay exact. */
+  truncated: boolean
+  checkedAt: number
+}
 export interface FavoriteEditor {
   token: string
   accountId: string
@@ -447,6 +527,8 @@ export interface FavoriteEditor {
   collected: boolean
   localCount: number
   folders: FavoriteFolder[]
+  /** Folders that already contain this work. */
+  folderIds: string[]
 }
 export interface FavoritesTask {
   id: string
@@ -483,13 +565,28 @@ export interface Outputs {
   favoritesControl: FavoritesTask
   favoriteFolders: FavoriteFolder[]
   favoriteFoldersRefresh: FavoriteFolder[]
+  favoriteFolderMemberships: { folderId: string; count: number }[]
   favoriteSyncToCloud: {
     synced: number
     remaining: number
+    scopeRemaining: number
     skipped: number
     skippedItems: { workId: string; kind: string; reason: string }[]
+    truncated: boolean
   }
+  favoriteWritebackPending: { total: number; items: PendingFavoriteWrite[] }
+  favoriteSyncAutoStart: { started: true }
+  favoriteSyncStop: null
+  favoriteFolderDiff: FavoriteFolderDiff
   favoriteFolderRemoveWorks: { folderId: string; folderTitle: string; removed: number }
+  favoriteFolderMoveWorks: {
+    fromFolderId: string
+    fromFolderTitle: string
+    toFolderId: string
+    toFolderTitle: string
+    moved: number
+    cloudSync: boolean
+  }
   favoriteFolderCreateLocal: FavoriteFolder
   favoriteFolderEditLocal: FavoriteFolder
   favoriteFolderDeleteLocal: { folderId: string; title: string; localCount: number }
@@ -556,6 +653,7 @@ export interface Outputs {
   backup: { fileName: string }
   dataInfo: DataInfo
   openDataFolder: null
+  pickCoverCacheDirectory: string | null
   clearCache: null
   media: Media
   comments: CommentPage

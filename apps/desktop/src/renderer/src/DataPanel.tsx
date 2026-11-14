@@ -3,7 +3,17 @@ import type { DataInfo } from '../../shared/contracts'
 import { call, type Perform } from './api'
 import { formatBytes as size } from './format'
 
-export function DataPanel({ accountId, perform }: { accountId: string | null; perform: Perform }) {
+export function DataPanel({
+  accountId,
+  perform,
+  coverCachePath,
+  updateCoverCachePath
+}: {
+  accountId: string | null
+  perform: Perform
+  coverCachePath: string
+  updateCoverCachePath: (path: string) => void
+}) {
   const [info, setInfo] = useState<DataInfo | null>(null),
     [error, setError] = useState('')
   const sequence = useRef(0)
@@ -66,6 +76,28 @@ export function DataPanel({ accountId, perform }: { accountId: string | null; pe
           打开备份目录
         </button>
         <button onClick={() => void refresh()}>刷新占用</button>
+      </div>
+      <h2>封面缓存</h2>
+      <p className="settings-description">
+        收藏夹与差异核对中的封面会按需下载到本机，避免云端地址失效后裂图。留空时使用应用数据目录下的 covers
+        文件夹。
+      </p>
+      <dl className="diagnostics">
+        <dt>缓存目录</dt>
+        <dd className="data-path">{coverCachePath || '默认：应用数据目录\\covers'}</dd>
+      </dl>
+      <div className="panel-actions">
+        <button
+          onClick={() =>
+            void perform('选择封面缓存目录', async () => {
+              const path = await call(window.mylike.invoke('pickCoverCacheDirectory', {}))
+              if (path) updateCoverCachePath(path)
+            })
+          }
+        >
+          选择缓存目录
+        </button>
+        {coverCachePath ? <button onClick={() => updateCoverCachePath('')}>恢复默认目录</button> : null}
       </div>
     </section>
   )

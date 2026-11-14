@@ -1,5 +1,5 @@
 import type { DatabaseSync } from 'node:sqlite'
-import type { FavoritesTask, FavoriteFolder, Work } from '../../shared/contracts'
+import type { FavoritesTask, FavoriteFolder, PendingFavoriteWrite, Work } from '../../shared/contracts'
 import { AppError } from '../errors'
 import { randomUUID } from 'node:crypto'
 import { FavoriteState } from './favorite-state'
@@ -397,6 +397,148 @@ export class FavoritesStore {
     )
     return pending
   }
+  /**
+   * The same queue that writePending counts, expanded into displayable rows.
+   * Rows already in favorite_write_ops come first; locally staged changes that
+   * will be queued by the next writeback are marked queued=false.
+   */
+  writebackPending(accountId: string): { total: number; items: PendingFavoriteWrite[] } {
+    const items = new Map<string, PendingFavoriteWrite>()
+    const add = (item: PendingFavoriteWrite) => {
+      const key = `${item.kind}\u0000${item.folderId ?? ''}\u0000${item.workId ?? ''}`
+      if (!items.has(key)) items.set(key, item)
+    }
+    const queued = this.db
+      .prepare(
+        `SELECT w.kind,nullif(w.folderId,'') AS folderId,nullif(w.workId,'') AS workId,
+        nullif(w.title,'') AS createTitle,
+        sf.title AS folderTitle,k.title AS workTitle,k.author,k.coverUrl
+        FROM favorite_write_ops w
+        LEFT JOIN saved_folders sf ON sf.accountId=w.accountId AND sf.id=w.folderId
+        LEFT JOIN works k ON k.id=w.workId
+        WHERE w.accountId=? ORDER BY w.id`
+      )
+      .all(accountId) as unknown as {
+      kind: PendingFavoriteWrite['kind']
+      folderId: string | null
+      workId: string | null
+      createTitle: string | null
+      folderTitle: string | null
+      workTitle: string | null
+      author: string | null
+      coverUrl: string | null
+    }[]
+    for (const row of queued)
+      add({
+        kind: row.kind,
+        folderId: row.folderId,
+        folderTitle: row.createTitle ?? row.folderTitle,
+        workId: row.workId,
+        workTitle: row.workTitle,
+        author: row.author,
+        coverUrl: row.coverUrl,
+        queued: true
+      })
+    for (const folder of this.folders(accountId).filter((entry) => entry.localOnly)) {
+      add({
+        kind: 'folder-create',
+        folderId: folder.id,
+        folderTitle: folder.title,
+        workId: null,
+        workTitle: null,
+        author: null,
+        coverUrl: folder.coverUrl ?? null,
+        queued: false
+      })
+      const members = this.db
+        .prepare(
+          `SELECT m.workId,k.title AS workTitle,k.author,k.coverUrl
+          FROM saved_members m LEFT JOIN works k ON k.id=m.workId
+          WHERE m.accountId=? AND m.folderId=? ORDER BY m.workId`
+        )
+        .all(accountId, folder.id) as unknown as {
+        workId: string
+        workTitle: string | null
+        author: string | null
+        coverUrl: string | null
+      }[]
+      for (const member of members)
+        add({
+          kind: 'folder-add',
+          folderId: folder.id,
+          folderTitle: folder.title,
+          workId: member.workId,
+          workTitle: member.workTitle,
+          author: member.author,
+          coverUrl: member.coverUrl,
+          queued: false
+        })
+    }
+    const defaults = this.db
+      .prepare(
+        `SELECT o.workId,k.title AS workTitle,k.author,k.coverUrl
+        FROM favorite_default_overrides o LEFT JOIN works k ON k.id=o.workId
+        WHERE o.accountId=? AND o.synced=0 ORDER BY o.workId`
+      )
+      .all(accountId) as unknown as {
+      workId: string
+      workTitle: string | null
+      author: string | null
+      coverUrl: string | null
+    }[]
+    for (const row of defaults)
+      add({
+        kind: 'favorite-add',
+        folderId: null,
+        folderTitle: null,
+        workId: row.workId,
+        workTitle: row.workTitle,
+        author: row.author,
+        coverUrl: row.coverUrl,
+        queued: false
+      })
+    const memberships = this.db
+      .prepare(
+        `SELECT o.folderId,o.workId,sf.title AS folderTitle,k.title AS workTitle,k.author,k.coverUrl
+        FROM favorite_member_overrides o
+        LEFT JOIN saved_folders sf ON sf.accountId=o.accountId AND sf.id=o.folderId
+        LEFT JOIN works k ON k.id=o.workId
+        WHERE o.accountId=? AND o.desired=1 AND o.synced=0`
+      )
+      .all(accountId) as unknown as {
+      folderId: string
+      workId: string
+      folderTitle: string | null
+      workTitle: string | null
+      author: string | null
+      coverUrl: string | null
+    }[]
+    for (const row of memberships)
+      add({
+        kind: 'folder-add',
+        folderId: row.folderId,
+        folderTitle: row.folderTitle,
+        workId: row.workId,
+        workTitle: row.workTitle,
+        author: row.author,
+        coverUrl: row.coverUrl,
+        queued: false
+      })
+    const order: Record<PendingFavoriteWrite['kind'], number> = {
+      'folder-create': 0,
+      'favorite-add': 1,
+      'folder-add': 2,
+      'folder-remove': 3
+    }
+    const all = [...items.values()].sort(
+      (a, b) =>
+        order[a.kind] - order[b.kind] ||
+        (a.folderTitle ?? '').localeCompare(b.folderTitle ?? '', 'zh') ||
+        (a.workTitle ?? a.workId ?? '').localeCompare(b.workTitle ?? b.workId ?? '', 'zh')
+    )
+    // Bound the IPC payload; the dialog shows the total separately.
+    return { total: all.length, items: all.slice(0, 200) }
+  }
   folderWorkIds(input: { accountId: string; folderId: string }): string[] {
     if (!this.folders(input.accountId).some((folder) => folder.id === input.folderId))
       throw new AppError('FOLDER_CHANGED', '收藏夹已变化，请重新读取。')
@@ -405,6 +547,42 @@ export class FavoritesStore {
         .prepare('SELECT workId FROM saved_members WHERE accountId=? AND folderId=?')
         .all(input.accountId, input.folderId) as { workId: string }[]
     ).map(({ workId }) => workId)
+  }
+  /** Memberships added locally that the cloud has never confirmed. */
+  folderUnsyncedWorkIds(input: { accountId: string; folderId: string }): string[] {
+    return (
+      this.db
+        .prepare(
+          `SELECT workId FROM favorite_member_overrides
+          WHERE accountId=? AND folderId=? AND desired=1 AND synced=0`
+        )
+        .all(input.accountId, input.folderId) as { workId: string }[]
+    ).map(({ workId }) => workId)
+  }
+  /** How many of the given works each folder already contains. */
+  folderMemberships(input: { accountId: string; workIds: string[] }): { folderId: string; count: number }[] {
+    const workIds = [...new Set(input.workIds)]
+    if (!workIds.length) return []
+    return this.db
+      .prepare(
+        `SELECT folderId,count(*) AS count FROM saved_members
+        WHERE accountId=? AND workId IN (${workIds.map(() => '?').join(',')})
+        GROUP BY folderId`
+      )
+      .all(input.accountId, ...workIds) as { folderId: string; count: number }[]
+  }
+  /** Full local works of a folder, used by the read-only writeback diff. */
+  folderWorks(input: { accountId: string; folderId: string }): Work[] {
+    if (!this.folders(input.accountId).some((folder) => folder.id === input.folderId))
+      throw new AppError('FOLDER_CHANGED', '收藏夹已变化，请重新读取。')
+    return (
+      this.db
+        .prepare(
+          `SELECT w.* FROM saved_members m JOIN works w ON w.id=m.workId
+          WHERE m.accountId=? AND m.folderId=? ORDER BY w.publishedAt DESC,w.id DESC`
+        )
+        .all(input.accountId, input.folderId) as unknown as Work[]
+    ).map((work) => ({ ...work, isLive: !!work.isLive }))
   }
   stageLocalFolders(input: {
     accountId: string
@@ -715,6 +893,13 @@ export class FavoritesStore {
         this.db
           .prepare('UPDATE saved_folders SET remoteCount=max(0,remoteCount-1) WHERE accountId=? AND id=?')
           .run(input.accountId, input.folderId)
+      // Any queued add for this membership is obsolete now; leaving it would let a
+      // later writeback silently add the work back to the folder.
+      this.db
+        .prepare(
+          "DELETE FROM favorite_write_ops WHERE accountId=? AND folderId=? AND workId=? AND kind='folder-add'"
+        )
+        .run(input.accountId, input.folderId, input.workId)
       // Keep the removal intent so a later sync cannot silently re-add a work
       // that is still present in the cloud because the remote write failed.
       this.db

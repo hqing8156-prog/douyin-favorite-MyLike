@@ -44,6 +44,7 @@ type Props = {
   unlike: (source?: 'likes' | 'favorites') => void
   unlikeBusy: boolean
   libraryRevision: number
+  cloudSyncEnabled: boolean
   queueOpen: boolean
   setQueueOpen: (open: boolean) => void
   fullscreenRoot: RefObject<HTMLDivElement | null>
@@ -67,6 +68,7 @@ export function Player({
   unlike,
   unlikeBusy,
   libraryRevision,
+  cloudSyncEnabled,
   queueOpen,
   setQueueOpen,
   fullscreenRoot,
@@ -948,6 +950,7 @@ export function Player({
           }}
           close={() => setFavoriteOpen(false)}
           login={login}
+          cloudSync={cloudSyncEnabled}
           saved={() => setCollected(true)}
         />
       )}

@@ -6,7 +6,7 @@ import {
   type Locator,
   type Page
 } from '@playwright/test'
-import { mkdtempSync, writeFileSync, rmSync } from 'node:fs'
+import { mkdtempSync, writeFileSync, rmSync, readdirSync, existsSync } from 'node:fs'
 import { basename, dirname, join, resolve } from 'node:path'
 import { tmpdir } from 'node:os'
 import type { Command, QueueState } from '../../src/shared/contracts'
@@ -3279,6 +3279,134 @@ test('selects and selects all favorite folders in the cloud writeback dialog', a
   await expect(dialog).toBeHidden()
 })
 
+test('shows a read-only per-folder diff in the writeback dialog without changing the selection', async ({}, info) => {
+  const { accountId } = await prepareQueue(1)
+  await app.evaluate(() => {
+    ;(globalThis as any).__favoriteWriteFixture = true
+  })
+  await invoke('favoriteFolderCreateLocal', {
+    accountId,
+    title: '差异本地夹',
+    private: false
+  })
+  await invoke('favoriteFolderCreateLocal', {
+    accountId,
+    title: '差异本地夹B',
+    private: false
+  })
+  await page.getByRole('button', { name: '顺序播放', exact: true }).click()
+  await readyVideo()
+  await page.getByRole('button', { name: '暂停播放', exact: true }).click()
+  await page.getByRole('button', { name: '收藏当前作品', exact: true }).click()
+  const favorite = page.getByRole('dialog', { name: '选择收藏夹', exact: true })
+  await favorite.getByRole('checkbox', { name: '差异本地夹', exact: true }).check()
+  await favorite.getByRole('button', { name: '保存', exact: true }).click()
+  await expect(favorite).toHaveCount(0)
+  await page.getByRole('button', { name: '返回内容库', exact: true }).click()
+  await invoke('appPreferences', { preferences: { syncFavoritesToCloud: true } })
+  await page.getByRole('button', { name: '收藏的内容', exact: true }).click()
+  await page.getByRole('button', { name: /写回云端/ }).click()
+  const dialog = page.getByRole('dialog', { name: '选择写回范围' })
+  const checkbox = dialog.getByRole('checkbox', { name: '写回收藏夹 差异本地夹', exact: true })
+  await expect(checkbox).not.toBeChecked()
+  const trigger = dialog.getByRole('button', { name: '查看 差异本地夹 的差异', exact: true })
+  await expect(trigger).toHaveAttribute('aria-expanded', 'false')
+  await trigger.click()
+  const panel = dialog.getByRole('region', { name: '差异本地夹 差异' })
+  await expect(panel).toContainText('该收藏夹尚未创建到云端')
+  await expect(panel).toContainText('写入 1 条作品')
+  await expect(panel.locator('.favorite-diff-card')).toHaveCount(1)
+  await expect(checkbox).not.toBeChecked()
+  // The diff panel must sit below the whole row, not push the next card out of it.
+  const firstBox = await dialog
+    .getByRole('checkbox', { name: '写回收藏夹 差异本地夹', exact: true })
+    .boundingBox()
+  const secondBox = await dialog
+    .getByRole('checkbox', { name: '写回收藏夹 差异本地夹B', exact: true })
+    .boundingBox()
+  const panelBox = await panel.boundingBox()
+  expect(firstBox && secondBox && panelBox).toBeTruthy()
+  expect(Math.abs(firstBox!.y - secondBox!.y)).toBeLessThan(4)
+  expect(panelBox!.y).toBeGreaterThan(firstBox!.y)
+  expect(await app.evaluate(() => (globalThis as any).__favoriteWrites ?? [])).toEqual([])
+  await screenshot(info.outputPath('writeback-folder-diff.png'))
+  await dialog.getByRole('button', { name: '收起 差异本地夹 的差异', exact: true }).click()
+  await expect(panel).toHaveCount(0)
+})
+
+test('shows both sides of a cloud folder diff in the writeback dialog', async ({}, info) => {
+  await prepareQueue(2)
+  await app.evaluate(() => {
+    ;(globalThis as any).__favoriteWriteFixture = true
+  })
+  await invoke('appPreferences', { preferences: { syncFavoritesToCloud: true } })
+  await page.getByRole('button', { name: '顺序播放', exact: true }).click()
+  await readyVideo()
+  await page.getByRole('button', { name: '暂停播放', exact: true }).click()
+  await page.getByRole('button', { name: '收藏当前作品', exact: true }).click()
+  const favorite = page.getByRole('dialog', { name: '选择收藏夹', exact: true })
+  await favorite.getByRole('checkbox', { name: '音乐', exact: true }).check()
+  await favorite.getByRole('button', { name: '保存', exact: true }).click()
+  await expect(favorite).toHaveCount(0)
+  await page.getByRole('button', { name: '下一条', exact: true }).click()
+  await readyVideo(1)
+  await page.getByRole('button', { name: '暂停播放', exact: true }).click()
+  await invoke('appPreferences', { preferences: { syncFavoritesToCloud: false } })
+  await page.getByRole('button', { name: '收藏当前作品', exact: true }).click()
+  await favorite.getByRole('checkbox', { name: '音乐', exact: true }).check()
+  await favorite.getByRole('button', { name: '保存', exact: true }).click()
+  await expect(favorite).toHaveCount(0)
+  await page.getByRole('button', { name: '返回内容库', exact: true }).click()
+  await invoke('appPreferences', { preferences: { syncFavoritesToCloud: true } })
+  await page.getByRole('button', { name: '收藏的内容', exact: true }).click()
+  await page.getByRole('button', { name: /写回云端/ }).click()
+  const dialog = page.getByRole('dialog', { name: '选择写回范围' })
+  await dialog.getByRole('button', { name: '查看 音乐 的差异', exact: true }).click()
+  const panel = dialog.getByRole('region', { name: '音乐 差异' })
+  await expect(panel).toContainText('云端列表已完整核对')
+  await expect(panel.getByRole('tab', { name: '本地有、云端无 2', exact: true })).toHaveAttribute(
+    'aria-selected',
+    'true'
+  )
+  await expect(panel.locator('.favorite-diff-card')).toHaveCount(2)
+  await panel.getByRole('tab', { name: '云端有、本地无 1', exact: true }).click()
+  await expect(panel.locator('.favorite-diff-card')).toHaveCount(1)
+  await expect(panel).toContainText('写回不会删除')
+  await screenshot(info.outputPath('writeback-cloud-folder-diff.png'))
+  const writes = await app.evaluate(() =>
+    (globalThis as any).__favoriteWrites.map((write: any) => write.operation)
+  )
+  expect(writes).toEqual(['favoriteAdd', 'favoriteFolderAdd'])
+})
+
+test('downloads covers into the default cache directory and follows a custom path', async () => {
+  await prepareQueue(1)
+  const loadCover = (url: string) =>
+    page.evaluate(
+      (source) =>
+        new Promise<boolean>((resolve) => {
+          const image = new Image()
+          image.onload = () => resolve(true)
+          image.onerror = () => resolve(false)
+          image.src = source
+        }),
+      `mylike://cover/?url=${encodeURIComponent(url)}`
+    )
+  const cachedFiles = (directory: string) =>
+    existsSync(directory) ? readdirSync(directory).filter((name) => name.endsWith('.img')).length : 0
+  const defaultDirectory = join(profile, 'covers')
+  expect(await loadCover('https://fixture.douyinpic.com/cover-one.svg')).toBe(true)
+  await expect.poll(() => cachedFiles(defaultDirectory)).toBe(1)
+
+  const customDirectory = join(profile, 'custom-covers')
+  await invoke('appPreferences', { preferences: { coverCachePath: customDirectory } })
+  // Changing the path moves existing covers instead of orphaning them.
+  await expect.poll(() => cachedFiles(customDirectory)).toBe(1)
+  await expect.poll(() => cachedFiles(defaultDirectory)).toBe(0)
+  expect(await loadCover('https://fixture.douyinpic.com/cover-two.svg')).toBe(true)
+  await expect.poll(() => cachedFiles(customDirectory)).toBe(2)
+})
+
 test('uses focused player shortcuts and keeps inputs and unlike confirmation protected', async ({}, info) => {
   test.setTimeout(testTimeout(90000))
   await prepareQueue(3)
@@ -5140,6 +5268,7 @@ test('keeps an already-sent unlike alive through a visible slider and preserves 
 
 test('adds liked work to multiple favorite folders through the page SDK and preserves fullscreen', async ({}, info) => {
   const { accountId } = await prepareQueue(3)
+  await invoke('appPreferences', { preferences: { syncFavoritesToCloud: true } })
   await app.evaluate(() => {
     ;(globalThis as any).__favoriteWriteFixture = true
   })
@@ -5190,8 +5319,49 @@ test('adds liked work to multiple favorite folders through the page SDK and pres
   await expect(page.getByRole('button', { name: '收藏当前作品', exact: true })).toHaveCount(0)
 })
 
+test('keeps a favorite local while cloud writeback is disabled and pushes it on writeback', async () => {
+  const { accountId } = await prepareQueue(2)
+  await app.evaluate(() => {
+    ;(globalThis as any).__favoriteWriteFixture = true
+  })
+  await page.getByRole('button', { name: '顺序播放', exact: true }).click()
+  await readyVideo()
+  await page.getByRole('button', { name: '暂停播放', exact: true }).click()
+  const current = (await invoke('snapshot')).data.playback as QueueState
+  await page.getByRole('button', { name: '收藏当前作品', exact: true }).click()
+  const dialog = page.getByRole('dialog', { name: '选择收藏夹', exact: true })
+  await expect(dialog.getByRole('note')).toContainText('云端写回已关闭')
+  await dialog.getByRole('checkbox', { name: '音乐', exact: true }).check()
+  await dialog.getByRole('button', { name: '保存', exact: true }).click()
+  await expect(dialog).toHaveCount(0)
+  await expect(page.locator('.favorite-control')).toHaveAttribute('aria-pressed', 'true')
+  expect(await app.evaluate(() => (globalThis as any).__favoriteWrites ?? [])).toEqual([])
+  expect((await invoke('favoriteStatus', { accountId, workId: current.work.id })).data.collected).toBe(true)
+  expect(
+    (await invoke('favoriteFolders', { accountId })).data.find((folder: any) => folder.id === '8').localCount
+  ).toBe(1)
+  expect((await invoke('snapshot')).data.favoriteWritePending).toBe(2)
+
+  await invoke('appPreferences', { preferences: { syncFavoritesToCloud: true } })
+  await page.getByRole('button', { name: '返回内容库', exact: true }).click()
+  await page.getByRole('button', { name: '收藏的内容', exact: true }).click()
+  await page.getByRole('button', { name: /写回云端/ }).click()
+  const writeback = page.getByRole('dialog', { name: '选择写回范围' })
+  await writeback.getByRole('button', { name: '全选', exact: true }).click()
+  await writeback.getByRole('button', { name: /写回所选范围/ }).click()
+  await expect(writeback).toHaveCount(0)
+  await expect
+    .poll(async () => (await invoke('snapshot')).data.favoriteWritePending, { timeout: 30000 })
+    .toBe(0)
+  expect(
+    await app.evaluate(() => (globalThis as any).__favoriteWrites.map((write: any) => write.operation))
+  ).toEqual(['favoriteAdd', 'favoriteFolderAdd'])
+  expect((await invoke('query', { accountId, source: 'favorites', folderId: '8' })).data.total).toBe(1)
+})
+
 test('creates private favorite folders, protects modal inputs and persists a custom favorite shortcut', async ({}, info) => {
   const { accountId } = await prepareQueue(2)
+  await invoke('appPreferences', { preferences: { syncFavoritesToCloud: true } })
   await app.evaluate(() => {
     ;(globalThis as any).__favoriteWriteFixture = true
   })
@@ -5261,6 +5431,7 @@ test('creates private favorite folders, protects modal inputs and persists a cus
 
 test('keeps confirmed favorite progress after an empty write response and requires fresh reads instead of automatic retries', async () => {
   const { accountId } = await prepareQueue(2)
+  await invoke('appPreferences', { preferences: { syncFavoritesToCloud: true } })
   await app.evaluate(() => {
     ;(globalThis as any).__favoriteWriteFixture = true
     ;(globalThis as any).__favoriteWriteFailure = 'favoriteFolderAdd'
@@ -5302,6 +5473,7 @@ test('keeps confirmed favorite progress after an empty write response and requir
 
 test('preserves an already sent favorite when a slider appears and never uses writes as recovery probes', async () => {
   const { accountId } = await prepareQueue(2)
+  await invoke('appPreferences', { preferences: { syncFavoritesToCloud: true } })
   await app.evaluate(() => {
     ;(globalThis as any).__favoriteWriteFixture = true
     ;(globalThis as any).__favoriteWriteHold = 'favoriteAdd'
@@ -5331,6 +5503,7 @@ test('preserves an already sent favorite when a slider appears and never uses wr
 
 test('waits for the current favorite write on close, skips remaining folders and keeps the confirmed result after restart', async () => {
   const { accountId } = await prepareQueue(2)
+  await invoke('appPreferences', { preferences: { syncFavoritesToCloud: true } })
   await app.evaluate(() => {
     ;(globalThis as any).__favoriteWriteFixture = true
     ;(globalThis as any).__favoriteWriteHold = 'favoriteAdd'
@@ -5681,6 +5854,33 @@ test('bulk uncollects the fixed favorites selection from a folder and persists r
     status: 'completed'
   })
   expect((await invoke('query', { accountId, source: 'favorites' })).data.total).toBe(0)
+})
+
+test('moves the selected works from one favorites folder to another', async () => {
+  test.setTimeout(testTimeout(90000))
+  const { accountId } = await prepareCollectedQueue(3)
+  await chooseOption('收藏夹筛选', '旅行 · 3')
+  await page.getByRole('button', { name: '批量选择', exact: true }).click()
+  await page.getByRole('button', { name: '选择全部筛选结果', exact: true }).click()
+  await expect(page.getByLabel('批量操作')).toContainText('已选 3 条')
+  await page.getByRole('button', { name: '移动到其他收藏夹', exact: true }).click()
+  const dialog = page.getByRole('dialog', { name: '移动到其他收藏夹', exact: true })
+  await expect(dialog).toContainText('3 条作品')
+  await expect(dialog.getByText('已含全部 3 条', { exact: true })).toBeVisible()
+  await expect(dialog.getByRole('radio', { name: '移动到 旅行', exact: true })).toHaveCount(0)
+  await dialog.getByRole('radio', { name: '移动到 音乐', exact: true }).check()
+  await dialog.getByRole('button', { name: '移动 3 条到所选收藏夹', exact: true }).click()
+  await expect(dialog).toHaveCount(0)
+  await expect(page.getByLabel('批量操作')).toHaveCount(0)
+  expect(
+    (await invoke('query', { accountId, source: 'favorites', folderId: '9007199254740993999' })).data.total
+  ).toBe(0)
+  expect((await invoke('query', { accountId, source: 'favorites', folderId: '8' })).data.total).toBe(3)
+  expect(
+    (await invoke('favoriteFolders', { accountId })).data.map((folder: any) => folder.localCount).sort()
+  ).toEqual([0, 3])
+  // Cloud writeback is off by default, so the move stays local.
+  expect(await app.evaluate(() => (globalThis as any).__favoriteWrites ?? [])).toEqual([])
 })
 
 test('pauses bulk uncollect on an unknown response and verifies read-only before continuing only unsent items', async () => {

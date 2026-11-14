@@ -24,6 +24,10 @@ import {
   shortcutActions,
   keyLabel,
   playbackRates,
+  WRITEBACK_BATCH_INTERVAL_MAX_SEC,
+  WRITEBACK_BATCH_INTERVAL_MIN_SEC,
+  WRITEBACK_BATCH_INTERVAL_RECOMMENDED_MAX_SEC,
+  WRITEBACK_BATCH_INTERVAL_RECOMMENDED_MIN_SEC,
   type AppPreferences,
   type ShortcutAction
 } from '../../shared/preferences'
@@ -54,7 +58,7 @@ const groups = [
     title: '通用',
     icon: Settings2,
     keywords:
-      '通用 外观 主题 白天 黑夜 启动 默认 页面 界面 缩放 字体 窗口 记忆 位置 尺寸 动画 AI DeepSeek SiliconFlow 收藏夹 分类 云端 写回 同步'
+      '通用 外观 主题 白天 黑夜 启动 默认 页面 界面 缩放 字体 窗口 记忆 位置 尺寸 动画 AI DeepSeek SiliconFlow 收藏夹 分类 云端 写回 同步 批次 间隔 自动续批'
   },
   {
     id: 'playback',
@@ -77,7 +81,7 @@ const groups = [
     id: 'storage',
     title: '数据与存储',
     icon: Database,
-    keywords: '数据 存储 备份 元数据 目录 路径 占用'
+    keywords: '数据 存储 备份 元数据 目录 路径 占用 封面 缓存 图片 缓存目录'
   },
   {
     id: 'about',
@@ -136,13 +140,30 @@ export function SettingsPanel({
   const [deepseekApiKey, setDeepseekApiKey] = useState('')
   const [siliconFlowApiKey, setSiliconFlowApiKey] = useState('')
   const [favoriteCategoryHints, setFavoriteCategoryHints] = useState('')
+  const [batchIntervalDraft, setBatchIntervalDraft] = useState(String(application.writebackBatchIntervalSec))
   useEffect(() => {
     setDeepseekApiKey(application.deepseekApiKey)
     setSiliconFlowApiKey(application.siliconFlowApiKey)
     setFavoriteCategoryHints(application.favoriteCategoryHints)
   }, [application.deepseekApiKey, application.siliconFlowApiKey, application.favoriteCategoryHints])
+  useEffect(() => {
+    setBatchIntervalDraft(String(application.writebackBatchIntervalSec))
+  }, [application.writebackBatchIntervalSec])
   const updateApplication = (patch: Partial<AppPreferences>) =>
     void perform('保存通用设置', () => call(window.mylike.invoke('appPreferences', { preferences: patch })))
+  const saveBatchInterval = () => {
+    const value = Math.round(Number(batchIntervalDraft))
+    if (
+      !Number.isFinite(value) ||
+      value < WRITEBACK_BATCH_INTERVAL_MIN_SEC ||
+      value > WRITEBACK_BATCH_INTERVAL_MAX_SEC
+    ) {
+      setBatchIntervalDraft(String(application.writebackBatchIntervalSec))
+      return
+    }
+    if (value === application.writebackBatchIntervalSec) return
+    updateApplication({ writebackBatchIntervalSec: value })
+  }
   const visible = (id: string) =>
     !search.trim() ||
     groups
@@ -261,13 +282,33 @@ export function SettingsPanel({
             </Row>
             <Row
               label="允许同步本地收藏夹到抖音"
-              description="开启后可在收藏夹页手动点击“写回云端”，把本机新增的收藏夹、AI 分类结果和新增作品写到抖音；不会自动上传，也不会把云端变化带回本地（云端变化请用“同步收藏夹”）"
+              description="开启后可在收藏夹页手动点击“写回云端”，把本机新增的收藏夹、AI 分类结果和新增作品写到抖音；关闭时播放页的“收藏”也只记录在本机。不会自动上传，也不会把云端变化带回本地（云端变化请用“同步收藏夹”）"
             >
               <Toggle
                 label="允许同步本地收藏夹到抖音"
                 value={application.syncFavoritesToCloud}
                 change={(syncFavoritesToCloud) => updateApplication({ syncFavoritesToCloud })}
               />
+            </Row>
+            <Row
+              label="写回批次间隔"
+              description={`一批写回结束到下一批开始的等待时间；建议 ${WRITEBACK_BATCH_INTERVAL_RECOMMENDED_MIN_SEC}–${WRITEBACK_BATCH_INTERVAL_RECOMMENDED_MAX_SEC} 秒，间隔越短越快，但连续写触发平台风控的风险越高`}
+            >
+              <input
+                type="number"
+                aria-label="写回批次间隔"
+                className="setting-seconds"
+                min={WRITEBACK_BATCH_INTERVAL_MIN_SEC}
+                max={WRITEBACK_BATCH_INTERVAL_MAX_SEC}
+                step={10}
+                value={batchIntervalDraft}
+                onChange={(event) => setBatchIntervalDraft(event.target.value)}
+                onBlur={saveBatchInterval}
+                onKeyDown={(event) => {
+                  if (event.key === 'Enter') event.currentTarget.blur()
+                }}
+              />
+              <span className="setting-unit">秒</span>
             </Row>
             <Row label="DeepSeek API Key" description="用于自动分析和分类收藏内容，仅保存在本机">
               <input
@@ -472,7 +513,12 @@ export function SettingsPanel({
             />
           </div>
           <div id="settings-storage" className="settings-section" hidden={!visible('storage')}>
-            <DataPanel accountId={account?.id ?? null} perform={perform} />
+            <DataPanel
+              accountId={account?.id ?? null}
+              perform={perform}
+              coverCachePath={application.coverCachePath}
+              updateCoverCachePath={(coverCachePath) => updateApplication({ coverCachePath })}
+            />
           </div>
           <section id="settings-about" className="panel settings-section" hidden={!visible('about')}>
             <div className="settings-about-brand">

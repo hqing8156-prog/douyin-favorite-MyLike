@@ -55,6 +55,12 @@ export class UnlikeStore {
           `UPDATE saved_folders SET remoteCount=max(0,remoteCount-1) WHERE accountId=? AND id IN (SELECT folderId FROM saved_members WHERE accountId=? AND workId=?)`
         )
         .run(accountId, accountId, workId)
+      // Locally saved collections carry pending platform writes. Once the work is
+      // uncollected, those intents must not be replayed by a later writeback.
+      this.db
+        .prepare('DELETE FROM favorite_member_overrides WHERE accountId=? AND workId=?')
+        .run(accountId, workId)
+      this.db.prepare('DELETE FROM favorite_write_ops WHERE accountId=? AND workId=?').run(accountId, workId)
     }
     const table = source === 'favorites' ? 'saved_items' : 'account_items'
     this.db.prepare(`DELETE FROM ${table} WHERE accountId=? AND workId=?`).run(accountId, workId)

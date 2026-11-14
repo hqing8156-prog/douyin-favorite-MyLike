@@ -305,6 +305,17 @@ const favoriteDetail = (id: string, collected = true) => ({
 it('atomically removes a confirmed collection from all folders, preserving likes, queues and other accounts', () => {
   const { store, file } = setup()
   collectFavorites(store)
+  // A local save made while cloud writeback was disabled leaves pending intents.
+  store.call('favoriteConfirm', {
+    accountId: 'a',
+    remoteId: 'remote-a',
+    work: work('1'),
+    folder: { id: '10', title: '10', remoteCount: 2, localCount: 0 },
+    queueWrite: true
+  })
+  expect(store.call('favoriteWriteOps', { accountId: 'a' })).toHaveLength(1)
+  const pendingBefore = store.call('favoriteWritePending', { accountId: 'a' })
+  expect(pendingBefore).toBeGreaterThan(0)
   const queue = store.call('queueCreate', {
     accountId: 'a',
     source: { type: 'ids', source: 'favorites', ids: ['1'], sort: 'published' },
@@ -332,6 +343,10 @@ it('atomically removes a confirmed collection from all folders, preserving likes
   ])
   expect(store.call('query', query).total).toBe(2)
   expect(store.call('query', { ...query, accountId: 'b', source: 'favorites' }).total).toBe(2)
+  // Uncollecting cancels the pending local intents for that work so a later
+  // writeback cannot silently re-add it.
+  expect(store.call('favoriteWriteOps', { accountId: 'a' })).toHaveLength(0)
+  expect(store.call('favoriteWritePending', { accountId: 'a' })).toBeLessThan(pendingBefore)
   expect(store.call('queueState', { accountId: 'a' })).toMatchObject({
     queueId: queue.queueId,
     work: { id: '1' }

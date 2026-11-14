@@ -129,7 +129,10 @@ it('persists application and playback preferences across restart without changin
     deepseekApiKey: '',
     siliconFlowApiKey: '',
     favoriteCategoryHints: '',
-    syncFavoritesToCloud: false
+    syncFavoritesToCloud: false,
+    autoContinueWriteback: false,
+    writebackBatchIntervalSec: 60,
+    coverCachePath: ''
   })
   expect(next.call('playbackPreferences', {})).toMatchObject({
     autoplay: false,

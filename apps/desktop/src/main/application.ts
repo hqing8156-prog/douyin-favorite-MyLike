@@ -2,9 +2,10 @@ import { HealthMonitor } from './health'
 import type { HealthSnapshot } from '../shared/health'
 import { FavoritesService } from './favorites'
 import { FavoriteActions } from './favorite-actions'
-import { app, shell, clipboard, type BrowserWindow } from 'electron'
+import { app, dialog, shell, clipboard, type BrowserWindow } from 'electron'
 import { join } from 'node:path'
 import { randomUUID } from 'node:crypto'
+import { WRITEBACK_BATCH_LIMIT } from '../shared/contracts'
 import type {
   Account,
   AiClassificationProgress,
@@ -13,6 +14,7 @@ import type {
   Query,
   Snapshot
 } from '../shared/contracts'
+import type { AppPreferences } from '../shared/preferences'
 import { Database } from './storage/client'
 import { DouyinEngine } from './douyin/engine'
 import {
@@ -37,6 +39,27 @@ import { metadataBytes } from './storage/usage'
 import { runtimeEventCategory, type RuntimeEventInput } from '../shared/runtime-events'
 import { AiClassifier } from './ai-classifier'
 import { LogFile } from './log-file'
+import { migrateCoverCache, resolveCoverCacheDir } from './cover-cache'
+
+type WritebackProgress = {
+  phase: 'checking' | 'writing' | 'waiting'
+  current: number
+  total: number
+  scopeRemaining: number
+  nextBatchAt: number | null
+  estimatedFinishAt: number | null
+  autoContinue: boolean
+  batchIntervalSec: number
+  batch: number
+}
+type WritebackResult = {
+  synced: number
+  remaining: number
+  scopeRemaining: number
+  skipped: number
+  skippedItems: { workId: string; kind: string; reason: string }[]
+  truncated: boolean
+}
 
 export class Application {
   private readonly health = new HealthMonitor()
@@ -57,6 +80,19 @@ export class Application {
     workId: string
     queueId: string | null
     cancelled: boolean
+  } | null = null
+  private favoriteSync: {
+    accountId: string
+    promise: Promise<void>
+    startedAt: number
+    progress: WritebackProgress
+  } | null = null
+  private favoriteSyncStopRequested = false
+  private favoriteSyncLast: {
+    accountId: string
+    status: 'completed' | 'stopped' | 'failed'
+    message: string | null
+    at: number
   } | null = null
   private closing = false
   private accountAction: Promise<unknown> | null = null
@@ -140,7 +176,10 @@ export class Application {
       () => {
         this.libraryRevision++
         changed()
-      }
+      },
+      // Writeback is background work: playback and other interactive requests
+      // keep priority between queued platform writes.
+      (action) => this.lane.run(true, action)
     )
     this.aiClassifier = new AiClassifier(
       database,
@@ -185,12 +224,29 @@ export class Application {
     const active = await this.database.call('setting', { key: 'activeAccount' })
     const theme = await this.database.call('setting', { key: 'theme' })
     const activeAccountId = accounts.some((a) => a.id === active) ? active : (accounts[0]?.id ?? null)
+    const favoriteWritePending = activeAccountId
+      ? await this.database.call('favoriteWritePending', { accountId: activeAccountId })
+      : 0
     return {
       accounts,
       textScan: this.textScan,
-      favoriteWritePending: activeAccountId
-        ? await this.database.call('favoriteWritePending', { accountId: activeAccountId })
-        : 0,
+      favoriteWritePending,
+      favoriteSync:
+        activeAccountId && this.favoriteSync?.accountId === activeAccountId
+          ? {
+              ...this.favoriteSync.progress,
+              remaining: favoriteWritePending,
+              startedAt: this.favoriteSync.startedAt
+            }
+          : null,
+      favoriteSyncLast:
+        activeAccountId && this.favoriteSyncLast?.accountId === activeAccountId
+          ? {
+              status: this.favoriteSyncLast.status,
+              message: this.favoriteSyncLast.message,
+              at: this.favoriteSyncLast.at
+            }
+          : null,
       aiClassification: this.aiClassification?.accountId === activeAccountId ? this.aiClassification : null,
       aiPendingAssignments: activeAccountId
         ? await this.database.call('aiAssignmentStats', { accountId: activeAccountId })
@@ -223,6 +279,157 @@ export class Application {
       appPreferences: await this.database.call('appPreferences', {}),
       version
     }
+  }
+  get favoriteSyncRunning(): boolean {
+    return this.favoriteSync !== null
+  }
+  /** Resolves when the current writeback stops, finishes or is cancelled. */
+  whenFavoriteSyncIdle(): Promise<void> {
+    return this.favoriteSync?.promise ?? Promise.resolve()
+  }
+  /** Approximate number of queued operations still waiting for the platform. */
+  async pendingFavoriteWrites(): Promise<number> {
+    const accountId = this.favoriteSync?.accountId
+    return accountId ? this.database.call('favoriteWritePending', { accountId }) : 0
+  }
+  /** Sleeps between batches; wakes promptly for stop, close or account changes. */
+  private async waitForWritebackBatch(ms: number, epoch: number): Promise<void> {
+    const end = Date.now() + ms
+    while (Date.now() < end) {
+      if (this.favoriteSyncStopRequested || this.closing || epoch !== this.epoch) return
+      await new Promise<void>((resolve) => setTimeout(resolve, Math.min(250, Math.max(1, end - Date.now()))))
+    }
+  }
+  private async prepareFavoriteWriteback(accountId: string): Promise<AppPreferences> {
+    await this.active(accountId)
+    const preferences = await this.database.call('appPreferences', {})
+    if (!preferences.syncFavoritesToCloud)
+      throw new AppError('SYNC_DISABLED', '请先在设置中启用收藏夹云端写回。')
+    this.assertAvailable(accountId, [
+      'folders',
+      'folderItems',
+      'favoriteAdd',
+      'favoriteFolderAdd',
+      'favoriteFolderRemove',
+      'favoriteFolderCreate',
+      'detail'
+    ])
+    await Promise.all([this.collection.pause(), this.favorites.pause()])
+    await this.favoriteActions.idle()
+    await this.lane.idle()
+    if (this.collection.running || this.favorites.running || this.unlike.running)
+      throw new AppError('BUSY', '请先停止其他采集或取消点赞 / 收藏任务，再写回收藏夹。')
+    return preferences
+  }
+  private runFavoriteWritebackBatch(
+    accountId: string,
+    scope: { folderIds: string[]; includeDefault: boolean },
+    progress: WritebackProgress,
+    perOpMs: { value: number }
+  ): Promise<WritebackResult> {
+    progress.batch++
+    progress.phase = 'checking'
+    progress.current = 0
+    progress.total = 0
+    progress.nextBatchAt = null
+    this.changed()
+    const batchStartedAt = Date.now()
+    return this.runUnlaned(accountId, (check) =>
+      this.favoriteActions.syncToCloud(accountId, check, scope, (update) => {
+        progress.phase = update.phase
+        progress.current = update.current
+        progress.total = update.total
+        progress.scopeRemaining = update.scopeRemaining
+        const now = Date.now()
+        if (update.current > 0) perOpMs.value = Math.max(1, (now - batchStartedAt) / update.current)
+        if (update.phase === 'writing')
+          progress.estimatedFinishAt = progress.autoContinue
+            ? now +
+              update.scopeRemaining * perOpMs.value +
+              Math.max(0, Math.ceil(update.scopeRemaining / WRITEBACK_BATCH_LIMIT) - 1) *
+                progress.batchIntervalSec *
+                1000
+            : null
+        this.changed()
+      })
+    )
+  }
+  /** Runs the detached auto-continue loop; the start command returns immediately. */
+  private async runFavoriteWritebackAuto(
+    accountId: string,
+    scope: { folderIds: string[]; includeDefault: boolean },
+    progress: WritebackProgress,
+    settle: () => void,
+    epoch: number
+  ): Promise<void> {
+    const perOpMs = { value: 1500 }
+    let stopped = false
+    try {
+      while (true) {
+        const result = await this.runFavoriteWritebackBatch(accountId, scope, progress, perOpMs)
+        if (result.scopeRemaining === 0 || this.favoriteSyncStopRequested || epoch !== this.epoch) break
+        const latest = await this.database.call('appPreferences', {})
+        progress.autoContinue = latest.autoContinueWriteback
+        progress.batchIntervalSec = latest.writebackBatchIntervalSec
+        if (!progress.autoContinue) {
+          stopped = true
+          break
+        }
+        const intervalMs = progress.batchIntervalSec * 1000
+        progress.phase = 'waiting'
+        progress.nextBatchAt = Date.now() + intervalMs
+        progress.estimatedFinishAt =
+          progress.nextBatchAt +
+          progress.scopeRemaining * perOpMs.value +
+          Math.max(0, Math.ceil(progress.scopeRemaining / WRITEBACK_BATCH_LIMIT) - 1) * intervalMs
+        this.changed()
+        await this.waitForWritebackBatch(intervalMs, epoch)
+        if (this.favoriteSyncStopRequested || epoch !== this.epoch) break
+      }
+      if (this.favoriteSyncStopRequested) stopped = true
+      if (epoch !== this.epoch) throw new AppError('CANCELLED', '操作已停止，旧结果已丢弃。')
+      this.favoriteSyncLast = {
+        accountId,
+        status: stopped ? 'stopped' : 'completed',
+        message: null,
+        at: Date.now()
+      }
+    } catch (error) {
+      const code = error instanceof AppError ? error.code : ''
+      if (!['CANCELLED', 'CLOSING'].includes(code)) {
+        await this.recordWritebackFailure(accountId, error)
+        this.favoriteSyncLast = {
+          accountId,
+          status: 'failed',
+          message: error instanceof Error ? error.message : String(error),
+          at: Date.now()
+        }
+      }
+    } finally {
+      this.favoriteSync = null
+      this.favoriteSyncStopRequested = false
+      settle()
+      this.changed()
+    }
+  }
+  private async recordWritebackFailure(accountId: string, error: unknown): Promise<void> {
+    if (!(error instanceof AppError) || ['CANCELLED', 'CLOSING'].includes(error.code)) return
+    const pending = await this.database.call('favoriteWriteOps', { accountId }).catch(() => [])
+    const listed = pending.slice(0, 100)
+    void this.logs.append(
+      'favorite-writeback.log',
+      [
+        `===== ${new Date().toISOString()} 写回失败：${error.code} ${error.message}`,
+        `剩余 ${pending.length} 项：`,
+        ...listed.map(
+          (operation) =>
+            `${operation.kind}\t${operation.folderId ?? ''}\t${operation.workId ?? ''}\t${operation.title ?? ''}`
+        ),
+        pending.length > listed.length ? `…其余 ${pending.length - listed.length} 项未列出` : ''
+      ]
+        .filter(Boolean)
+        .join('\n') + '\n'
+    )
   }
   async applyAppearance(theme?: 'dark' | 'light'): Promise<void> {
     const value = theme ?? (await this.database.call('setting', { key: 'theme' }))
@@ -259,28 +466,44 @@ export class Application {
     operation: (check: () => void) => Promise<T>,
     background = false
   ): Promise<T> {
+    const started = Date.now()
+    try {
+      return await this.lane.run(background, () => this.guarded(accountId, operation))
+    } finally {
+      const elapsed = Date.now() - started
+      // Surfaces operations that keep the shared request lane busy for long.
+      if (elapsed > 15_000) console.warn(`[lane] waited+held ${elapsed}ms background=${background}`)
+    }
+  }
+  /**
+   * Runs a batch that acquires the platform lane per request instead of holding
+   * it for the whole operation. Writeback uses this so playback can fetch media
+   * between queued platform writes.
+   */
+  private async runUnlaned<T>(accountId: string, operation: (check: () => void) => Promise<T>): Promise<T> {
+    return this.guarded(accountId, operation)
+  }
+  private async guarded<T>(accountId: string, operation: (check: () => void) => Promise<T>): Promise<T> {
     const epoch = this.epoch
     const check = () => {
       if (epoch !== this.epoch) throw new AppError('CANCELLED', '操作已停止，旧结果已丢弃。')
     }
-    return this.lane.run(background, async () => {
-      await this.exclusive(async () => {
-        if (this.closing) throw new AppError('CLOSING', '应用正在退出，未发送新的请求。')
-        if (this.accountAction) throw new AppError('BUSY', '账号操作正在收口，请稍候。')
-        check()
-        await this.active(accountId)
-        this.busy = true
-      })
-      this.changed()
-      try {
-        const result = await operation(check)
-        check()
-        return result
-      } finally {
-        this.busy = false
-        this.changed()
-      }
+    await this.exclusive(async () => {
+      if (this.closing) throw new AppError('CLOSING', '应用正在退出，未发送新的请求。')
+      if (this.accountAction) throw new AppError('BUSY', '账号操作正在收口，请稍候。')
+      check()
+      await this.active(accountId)
+      this.busy = true
     })
+    this.changed()
+    try {
+      const result = await operation(check)
+      check()
+      return result
+    } finally {
+      this.busy = false
+      this.changed()
+    }
   }
   private async identity(accountId: string, check: () => void): Promise<Account> {
     const identity = parseIdentity(await this.engine.request(accountId, 'self'))
@@ -627,7 +850,7 @@ export class Application {
     this.epoch++
     this.engine.release()
 
-    await paused
+    await Promise.all([paused, this.whenFavoriteSyncIdle()])
     await this.lane.idle()
   }
   async execute(command: Command, input: any): Promise<unknown> {
@@ -646,12 +869,15 @@ export class Application {
         'favoriteCreateFolder',
         'favoriteFolderEditLocal',
         'favoriteFolderRemoveWorks',
+        'favoriteFolderMoveWorks',
         'aiClassifyFavorites',
         'aiSuggestFolders',
         'aiResumeClassification',
         'aiImportClassificationLog',
         'favoriteFoldersRefresh',
-        'favoriteSyncToCloud'
+        'favoriteFolderDiff',
+        'favoriteSyncToCloud',
+        'favoriteSyncAutoStart'
       ].includes(command) ||
       (['collectionControl', 'favoritesControl', 'unlikeControl'].includes(command) &&
         input.action === 'resume')
@@ -690,19 +916,37 @@ export class Application {
         'favoriteFolderCreateLocal',
         'favoriteFolderEditLocal',
         'favoriteFolderDeleteLocal',
+        'favoriteFolderMoveWorks',
         'aiClassifyFavorites',
         'aiSuggestFolders',
         'aiResumeClassification',
         'aiImportClassificationLog',
         'favoriteFoldersRefresh',
+        'favoriteFolderDiff',
         'favoriteSyncToCloud',
+        'favoriteSyncAutoStart',
         'unlikeVerify'
       ].includes(command)
     )
       throw new AppError('BUSY', '请先停止取消点赞或收藏任务，等待当前请求结果保存。')
     switch (command) {
       case 'appPreferences': {
+        const previous = await this.database.call('appPreferences', {})
         const value = await this.database.call('appPreferences', input)
+        if (value.coverCachePath !== previous.coverCachePath) {
+          const userData = app.getPath('userData')
+          const source = resolveCoverCacheDir(previous.coverCachePath, userData)
+          const destination = resolveCoverCacheDir(value.coverCachePath, userData)
+          void migrateCoverCache(source, destination)
+            .then((moved) => {
+              if (moved) console.info(`[cover] migrated ${moved} covers to ${destination}`)
+            })
+            .catch((error) =>
+              console.warn(
+                `[cover] migration failed: ${error instanceof Error ? error.message : String(error)}`
+              )
+            )
+        }
         this.parent()?.webContents.setZoomFactor(value.zoom)
         this.changed()
         return value
@@ -913,6 +1157,37 @@ export class Application {
       case 'favoriteFolders':
         await this.active(input.accountId)
         return this.database.call('favoriteFolders', input)
+      case 'favoriteFolderMemberships':
+        await this.active(input.accountId)
+        return this.database.call('favoriteFolderMemberships', input)
+      case 'favoriteWritebackPending':
+        await this.active(input.accountId)
+        return this.database.call('favoriteWritebackPending', input)
+      case 'favoriteFolderDiff': {
+        await this.active(input.accountId)
+        console.info(
+          `[diff] start folder=${input.folderId} lanePending=${this.lane.pending} busy=${this.busy} writeback=${!!this.favoriteSync} ai=${this.aiClassification?.status ?? 'none'}`
+        )
+        const ai = this.aiClassification
+        if (ai && ai.accountId === input.accountId && ai.status === 'running')
+          throw new AppError('BUSY', 'AI 分类正在运行，请等它完成后再核对收藏夹差异。')
+        const folder = (await this.database.call('favoriteFolders', { accountId: input.accountId })).find(
+          (entry) => entry.id === input.folderId
+        )
+        if (!folder) throw new AppError('FOLDER_CHANGED', '收藏夹已变化，请重新核对。')
+        if (!folder.localOnly) this.assertAvailable(input.accountId, ['folderItems'])
+        if (this.collection.running || this.favorites.running || this.unlike.running)
+          throw new AppError('BUSY', '请先暂停采集或取消点赞 / 收藏任务，再核对收藏夹差异。')
+        try {
+          return await this.favoriteActions.diffFolder(input.accountId, input.folderId)
+        } catch (error) {
+          console.warn(
+            `[diff] failed folder=${input.folderId} code=${error instanceof AppError ? error.code : 'INTERNAL_ERROR'}`,
+            error instanceof Error ? error.message : error
+          )
+          throw error
+        }
+      }
       case 'favoriteFolderCreateLocal': {
         const account = await this.active(input.accountId)
         const preferences = await this.database.call('appPreferences', {})
@@ -946,30 +1221,98 @@ export class Application {
         if (this.collection.running || this.favorites.running || this.unlike.running)
           throw new AppError('BUSY', '请先停止其他采集或取消点赞 / 收藏任务，再核实收藏夹。')
         return this.favoriteActions.refreshFolders(input.accountId)
-      case 'favoriteSyncToCloud':
-        await this.active(input.accountId)
-        if (!(await this.database.call('appPreferences', {})).syncFavoritesToCloud)
-          throw new AppError('SYNC_DISABLED', '请先在设置中启用收藏夹云端写回。')
-        this.assertAvailable(input.accountId, [
-          'folders',
-          'folderItems',
-          'favoriteAdd',
-          'favoriteFolderAdd',
-          'favoriteFolderRemove',
-          'favoriteFolderCreate',
-          'detail'
-        ])
-        await Promise.all([this.collection.pause(), this.favorites.pause()])
-        await this.favoriteActions.idle()
-        await this.lane.idle()
-        if (this.collection.running || this.favorites.running || this.unlike.running)
-          throw new AppError('BUSY', '请先停止其他采集或取消点赞 / 收藏任务，再写回收藏夹。')
-        return this.run(input.accountId, (check) =>
-          this.favoriteActions.syncToCloud(input.accountId, check, {
-            folderIds: input.folderIds,
-            includeDefault: input.includeDefault
+      case 'favoriteSyncToCloud': {
+        if (this.favoriteSync) throw new AppError('BUSY', '写回正在进行，请等待完成或停止后再试。')
+        const preferences = await this.prepareFavoriteWriteback(input.accountId)
+        let settle!: () => void
+        const promise = new Promise<void>((resolve) => (settle = resolve))
+        const progress: WritebackProgress = {
+          phase: 'checking',
+          current: 0,
+          total: 0,
+          scopeRemaining: 0,
+          nextBatchAt: null,
+          estimatedFinishAt: null,
+          autoContinue: false,
+          batchIntervalSec: preferences.writebackBatchIntervalSec,
+          batch: 0
+        }
+        this.favoriteSync = {
+          accountId: input.accountId,
+          promise,
+          startedAt: Date.now(),
+          progress
+        }
+        this.favoriteSyncStopRequested = false
+        this.favoriteSyncLast = null
+        const scope = { folderIds: input.folderIds, includeDefault: input.includeDefault }
+        const epoch = this.epoch
+        try {
+          const result = await this.runFavoriteWritebackBatch(input.accountId, scope, progress, {
+            value: 1500
           })
+          if (epoch !== this.epoch) throw new AppError('CANCELLED', '操作已停止，旧结果已丢弃。')
+          this.favoriteSyncLast = {
+            accountId: input.accountId,
+            status: this.favoriteSyncStopRequested ? 'stopped' : 'completed',
+            message: null,
+            at: Date.now()
+          }
+          return result
+        } catch (error) {
+          if (!(error instanceof AppError && ['CANCELLED', 'CLOSING'].includes(error.code))) {
+            await this.recordWritebackFailure(input.accountId, error)
+            this.favoriteSyncLast = {
+              accountId: input.accountId,
+              status: 'failed',
+              message: error instanceof Error ? error.message : String(error),
+              at: Date.now()
+            }
+          }
+          throw error
+        } finally {
+          this.favoriteSync = null
+          this.favoriteSyncStopRequested = false
+          settle()
+          this.changed()
+        }
+      }
+      case 'favoriteSyncAutoStart': {
+        if (this.favoriteSync) throw new AppError('BUSY', '写回正在进行，请等待完成或停止后再试。')
+        const autoPreferences = await this.database.call('appPreferences', {})
+        if (!autoPreferences.autoContinueWriteback)
+          throw new AppError('AUTO_DISABLED', '请先在任务页开启自动续批。')
+        const preferences = await this.prepareFavoriteWriteback(input.accountId)
+        let settle!: () => void
+        const promise = new Promise<void>((resolve) => (settle = resolve))
+        const progress: WritebackProgress = {
+          phase: 'checking',
+          current: 0,
+          total: 0,
+          scopeRemaining: 0,
+          nextBatchAt: null,
+          estimatedFinishAt: null,
+          autoContinue: true,
+          batchIntervalSec: preferences.writebackBatchIntervalSec,
+          batch: 0
+        }
+        this.favoriteSync = {
+          accountId: input.accountId,
+          promise,
+          startedAt: Date.now(),
+          progress
+        }
+        this.favoriteSyncStopRequested = false
+        this.favoriteSyncLast = null
+        const scope = { folderIds: input.folderIds, includeDefault: input.includeDefault }
+        void this.runFavoriteWritebackAuto(input.accountId, scope, progress, settle, this.epoch).catch(
+          (error) => console.error('[MyLike] Writeback loop failed.', error)
         )
+        return { started: true }
+      }
+      case 'favoriteSyncStop':
+        this.favoriteSyncStopRequested = true
+        return null
       case 'favoriteFolderRemoveWorks':
         await this.active(input.accountId)
         await Promise.all([this.collection.pause(), this.favorites.pause()])
@@ -978,6 +1321,20 @@ export class Application {
         if (this.collection.running || this.favorites.running || this.unlike.running)
           throw new AppError('BUSY', '请先停止其他采集或取消点赞 / 收藏任务，再移出收藏夹。')
         return this.favoriteActions.removeFromFolder(input.accountId, input.folderId, input.workIds)
+      case 'favoriteFolderMoveWorks': {
+        await this.active(input.accountId)
+        await Promise.all([this.collection.pause(), this.favorites.pause()])
+        await this.favoriteActions.idle()
+        await this.lane.idle()
+        if (this.collection.running || this.favorites.running || this.unlike.running)
+          throw new AppError('BUSY', '请先停止其他采集或取消点赞 / 收藏任务，再移动收藏夹内容。')
+        return this.favoriteActions.moveToFolder(
+          input.accountId,
+          input.fromFolderId,
+          input.toFolderId,
+          input.workIds
+        )
+      }
       case 'favoriteStatus':
         await this.active(input.accountId)
         return this.database.call('favoriteStatus', input)
@@ -1366,6 +1723,16 @@ export class Application {
         return this.maintenance.info()
       case 'openDataFolder':
         return this.maintenance.open(input.target)
+      case 'pickCoverCacheDirectory': {
+        const options = {
+          title: '选择封面缓存目录',
+          buttonLabel: '使用此目录',
+          properties: ['openDirectory' as const, 'createDirectory' as const]
+        }
+        const win = this.parent()
+        const result = win ? await dialog.showOpenDialog(win, options) : await dialog.showOpenDialog(options)
+        return result.canceled ? null : (result.filePaths[0] ?? null)
+      }
       case 'clearCache':
         await this.active(input.accountId)
         await this.quiesce()
@@ -1513,7 +1880,7 @@ export class Application {
     this.epoch++
     this.engine.release()
 
-    await paused
+    await Promise.all([paused, this.whenFavoriteSyncIdle()])
     await this.lane.idle()
     // Window preferences must never prevent inflight business results from being saved.
     const win = this.parent()

@@ -53,7 +53,8 @@
 .connection-actions button,
 .simple-task-actions button,
 .task-tool-actions button,
-.unlike-records button {
+.unlike-records button,
+.writeback-controls > button {
   font-size: 12px;
   padding: 8px 11px;
   background: transparent;
@@ -211,12 +212,10 @@
 .writeback-auto-box {
   display: inline-flex;
   align-items: center;
-  gap: 8px;
-  height: 36px;
-  padding: 0 4px 0 12px;
+  gap: 6px;
+  padding: 4px 4px 4px 11px;
   border: 1px solid var(--line);
   border-radius: 8px;
-  background: var(--surface2);
   color: var(--muted);
   font-size: 12px;
   white-space: nowrap;
@@ -225,7 +224,7 @@
   justify-content: center;
   width: 26px;
   min-width: 26px;
-  height: 34px;
+  height: 24px;
   padding: 0;
   gap: 0;
   border: 0;
@@ -234,12 +233,6 @@
 }
 .writeback-auto-box .select-trigger:hover:not(:disabled) {
   background: var(--line);
-}
-.writeback-controls > button {
-  height: 36px;
-  padding: 0 14px;
-  gap: 6px;
-  font-size: 12px;
 }
 .simple-task > .task-note {
   margin: 10px 0 0;

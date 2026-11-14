@@ -71,6 +71,8 @@ export function ConnectionPanel({
   const lastSync = snapshot?.favoriteSyncLast ?? null
   const pendingWrites = snapshot?.favoriteWritePending ?? 0
   const autoContinue = snapshot?.appPreferences.autoContinueWriteback ?? false
+  // Keep the card out of the way unless it has pending work, is running, or last failed.
+  const showWriteback = !!sync || pendingWrites > 0 || autoContinue || lastSync?.status === 'failed'
   const changedFolders = folders.filter(
     (folder) =>
       folder.localOnly || folder.localCount !== folder.remoteCount || (folder.pendingWrites ?? 0) > 0
@@ -216,100 +218,101 @@ export function ConnectionPanel({
               </section>
             )
           })}
-          {/* TODO: 测试期常驻；稳定后再按“已开启写回 / 有待写回项”隐藏。 */}
-          <section className="simple-task" aria-label="写回云端">
-            <div className="simple-task-heading">
-              <h2>写回云端</h2>
-              <span
-                className={`task-badge${sync ? ' running' : lastSync?.status === 'failed' ? ' attention' : ''}`}
-              >
-                {sync
-                  ? sync.phase === 'waiting'
-                    ? '等待中'
-                    : '进行中'
-                  : lastSync?.status === 'failed'
-                    ? '上次失败'
-                    : pendingWrites
-                      ? '待写回'
-                      : '未开始'}
-              </span>
-            </div>
-            <div className="simple-task-body">
-              <div className="simple-task-copy">
-                <p>
+          {showWriteback && (
+            <section className="simple-task" aria-label="写回云端">
+              <div className="simple-task-heading">
+                <h2>写回云端</h2>
+                <span
+                  className={`task-badge${sync ? ' running' : lastSync?.status === 'failed' ? ' attention' : ''}`}
+                >
                   {sync
-                    ? sync.phase === 'checking'
-                      ? `第 ${sync.batch} 批 · 正在核对云端收藏夹…`
-                      : sync.phase === 'waiting'
-                        ? `第 ${sync.batch} 批已完成 · ${waitSeconds} 秒后开始下一批`
-                        : `第 ${sync.batch} 批 · 已处理 ${sync.current}/${sync.total} 项（${syncPercent}%）`
-                    : pendingWrites
-                      ? `有 ${pendingWrites} 项本地改动等待写回`
-                      : '本地改动已全部写回'}
-                </p>
-                {sync && sync.phase === 'writing' && (
-                  <span className="task-activity">剩余约 {sync.scopeRemaining} 项</span>
-                )}
+                    ? sync.phase === 'waiting'
+                      ? '等待中'
+                      : '进行中'
+                    : lastSync?.status === 'failed'
+                      ? '上次失败'
+                      : pendingWrites
+                        ? '待写回'
+                        : '未开始'}
+                </span>
               </div>
-              <div className="writeback-controls" role="group" aria-label="写回云端控制">
-                <div className="writeback-auto-box">
-                  <span>自动续批</span>
-                  <Select
-                    label="自动续批"
-                    value={autoContinue ? 'on' : 'off'}
-                    options={[
-                      { value: 'on', label: '已开启' },
-                      { value: 'off', label: '已关闭' }
-                    ]}
-                    hideValue
-                    onChange={(value) => saveAuto(value === 'on')}
-                  />
+              <div className="simple-task-body">
+                <div className="simple-task-copy">
+                  <p>
+                    {sync
+                      ? sync.phase === 'checking'
+                        ? `第 ${sync.batch} 批 · 正在核对云端收藏夹…`
+                        : sync.phase === 'waiting'
+                          ? `第 ${sync.batch} 批已完成 · ${waitSeconds} 秒后开始下一批`
+                          : `第 ${sync.batch} 批 · 已处理 ${sync.current}/${sync.total} 项（${syncPercent}%）`
+                      : pendingWrites
+                        ? `有 ${pendingWrites} 项本地改动等待写回`
+                        : '本地改动已全部写回'}
+                  </p>
+                  {sync && sync.phase === 'writing' && (
+                    <span className="task-activity">剩余约 {sync.scopeRemaining} 项</span>
+                  )}
                 </div>
-                <button
-                  type="button"
-                  disabled={!accountId || busy || syncRunning || !foldersLoaded}
-                  onClick={startWriteback}
-                  title={
-                    autoContinue
-                      ? '把有待写回改动的收藏夹与默认收藏写回抖音，并自动继续后续批次'
-                      : '把有待写回改动的收藏夹与默认收藏写回抖音'
-                  }
-                >
-                  <Play size={15} />
-                  开始
-                </button>
-                <button
-                  type="button"
-                  disabled={!syncRunning}
-                  onClick={stopAuto}
-                  title="停止当前批次及后续批次"
-                >
-                  <Square size={15} />
-                  停止
-                </button>
+                <div className="writeback-controls" role="group" aria-label="写回云端控制">
+                  <div className="writeback-auto-box">
+                    <span>自动续批</span>
+                    <Select
+                      label="自动续批"
+                      value={autoContinue ? 'on' : 'off'}
+                      options={[
+                        { value: 'on', label: '已开启' },
+                        { value: 'off', label: '已关闭' }
+                      ]}
+                      hideValue
+                      onChange={(value) => saveAuto(value === 'on')}
+                    />
+                  </div>
+                  <button
+                    type="button"
+                    disabled={!accountId || busy || syncRunning || !foldersLoaded}
+                    onClick={startWriteback}
+                    title={
+                      autoContinue
+                        ? '把有待写回改动的收藏夹与默认收藏写回抖音，并自动继续后续批次'
+                        : '把有待写回改动的收藏夹与默认收藏写回抖音'
+                    }
+                  >
+                    <Play size={15} />
+                    开始
+                  </button>
+                  <button
+                    type="button"
+                    disabled={!syncRunning}
+                    onClick={stopAuto}
+                    title="停止当前批次及后续批次"
+                  >
+                    <Square size={15} />
+                    停止
+                  </button>
+                </div>
               </div>
-            </div>
-            {sync?.autoContinue ? (
-              <p className="task-note">自动续批设置与批次间隔修改会在下一批生效。</p>
-            ) : null}
-            <p className="task-note">{estimate}</p>
-            {sync ? (
-              sync.phase === 'checking' ? (
-                <div className="task-working" role="progressbar" aria-label="正在核对云端收藏夹" />
-              ) : (
-                <div
-                  className="task-progress"
-                  role="progressbar"
-                  aria-label="写回云端进度"
-                  aria-valuemin={0}
-                  aria-valuemax={sync.total}
-                  aria-valuenow={sync.current}
-                >
-                  <span style={{ width: `${syncPercent}%` }} />
-                </div>
-              )
-            ) : null}
-          </section>
+              {sync?.autoContinue ? (
+                <p className="task-note">自动续批设置与批次间隔修改会在下一批生效。</p>
+              ) : null}
+              <p className="task-note">{estimate}</p>
+              {sync ? (
+                sync.phase === 'checking' ? (
+                  <div className="task-working" role="progressbar" aria-label="正在核对云端收藏夹" />
+                ) : (
+                  <div
+                    className="task-progress"
+                    role="progressbar"
+                    aria-label="写回云端进度"
+                    aria-valuemin={0}
+                    aria-valuemax={sync.total}
+                    aria-valuenow={sync.current}
+                  >
+                    <span style={{ width: `${syncPercent}%` }} />
+                  </div>
+                )
+              ) : null}
+            </section>
+          )}
           <section className="simple-task" aria-label="AI 自动分类进度">
             <div className="simple-task-heading">
               <h2>AI 自动分类</h2>

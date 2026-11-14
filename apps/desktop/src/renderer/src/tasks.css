@@ -200,6 +200,50 @@
   flex-shrink: 0;
   justify-content: flex-end;
 }
+.writeback-controls {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  justify-content: flex-end;
+  flex-shrink: 0;
+  gap: 8px;
+}
+.writeback-auto-box {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  height: 36px;
+  padding: 0 4px 0 12px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: var(--surface2);
+  color: var(--muted);
+  font-size: 12px;
+  white-space: nowrap;
+}
+.writeback-auto-box .select-trigger {
+  justify-content: center;
+  width: 26px;
+  min-width: 26px;
+  height: 34px;
+  padding: 0;
+  gap: 0;
+  border: 0;
+  border-radius: 6px;
+  background: transparent;
+}
+.writeback-auto-box .select-trigger:hover:not(:disabled) {
+  background: var(--line);
+}
+.writeback-controls > button {
+  height: 36px;
+  padding: 0 14px;
+  gap: 6px;
+  font-size: 12px;
+}
+.simple-task > .task-note {
+  margin: 10px 0 0;
+}
 .simple-task-actions .task-text-button {
   border-color: transparent;
   color: var(--muted);

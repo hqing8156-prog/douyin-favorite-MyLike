@@ -100,6 +100,11 @@ export function keyLabel(code: string): string {
   }
   return labels[code] ?? code.replace('Key', '')
 }
+export const WRITEBACK_BATCH_INTERVAL_MIN_SEC = 10
+export const WRITEBACK_BATCH_INTERVAL_MAX_SEC = 600
+export const WRITEBACK_BATCH_INTERVAL_DEFAULT_SEC = 60
+export const WRITEBACK_BATCH_INTERVAL_RECOMMENDED_MIN_SEC = 60
+export const WRITEBACK_BATCH_INTERVAL_RECOMMENDED_MAX_SEC = 120
 export const appPreferencesSchema = z.object({
   startupPage: z.enum(['library', 'dashboard', 'favorites', 'tasks']).default('library'),
   zoom: z.union([z.literal(0.9), z.literal(1), z.literal(1.1), z.literal(1.25), z.literal(1.5)]).default(1),
@@ -108,7 +113,16 @@ export const appPreferencesSchema = z.object({
   deepseekApiKey: z.string().max(300).default(''),
   siliconFlowApiKey: z.string().max(300).default(''),
   favoriteCategoryHints: z.string().max(2000).default(''),
-  syncFavoritesToCloud: z.boolean().default(false)
+  syncFavoritesToCloud: z.boolean().default(false),
+  autoContinueWriteback: z.boolean().default(false),
+  writebackBatchIntervalSec: z
+    .number()
+    .int()
+    .min(WRITEBACK_BATCH_INTERVAL_MIN_SEC)
+    .max(WRITEBACK_BATCH_INTERVAL_MAX_SEC)
+    .default(WRITEBACK_BATCH_INTERVAL_DEFAULT_SEC),
+  /** Empty means <userData>/covers. Covers are cached on demand. */
+  coverCachePath: z.string().trim().max(500).default('')
 })
 export type AppPreferences = z.infer<typeof appPreferencesSchema>
 export const appPreferencesPatchSchema = z.object({
@@ -119,7 +133,10 @@ export const appPreferencesPatchSchema = z.object({
   deepseekApiKey: appPreferencesSchema.shape.deepseekApiKey.removeDefault().optional(),
   siliconFlowApiKey: appPreferencesSchema.shape.siliconFlowApiKey.removeDefault().optional(),
   favoriteCategoryHints: appPreferencesSchema.shape.favoriteCategoryHints.removeDefault().optional(),
-  syncFavoritesToCloud: appPreferencesSchema.shape.syncFavoritesToCloud.removeDefault().optional()
+  syncFavoritesToCloud: appPreferencesSchema.shape.syncFavoritesToCloud.removeDefault().optional(),
+  autoContinueWriteback: appPreferencesSchema.shape.autoContinueWriteback.removeDefault().optional(),
+  writebackBatchIntervalSec: appPreferencesSchema.shape.writebackBatchIntervalSec.removeDefault().optional(),
+  coverCachePath: appPreferencesSchema.shape.coverCachePath.removeDefault().optional()
 })
 export interface WindowState {
   x: number

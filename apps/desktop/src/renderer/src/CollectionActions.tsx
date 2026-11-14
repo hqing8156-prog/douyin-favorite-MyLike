@@ -115,6 +115,7 @@ export function CollectionActions({
           folders={folders}
           pendingWrites={pendingWrites}
           busy={busy}
+          autoContinue={snapshot?.appPreferences.autoContinueWriteback ?? false}
           perform={perform}
           close={() => setWritebackOpen(false)}
           notice={notice}

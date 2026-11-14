@@ -9,11 +9,13 @@ export function FavoriteDialog({
   scope,
   close,
   login,
+  cloudSync,
   saved
 }: {
   scope: PlaybackScope & { workId: string }
   close: () => void
   login: () => void
+  cloudSync: boolean
   saved: () => void
 }) {
   const dialog = useRef<HTMLDialogElement>(null)
@@ -184,6 +186,11 @@ export function FavoriteDialog({
           </div>
         </form>
       )}
+      {!cloudSync && (
+        <p className="favorite-local-note" role="note">
+          云端写回已关闭，保存只会记录在本机；可在设置中开启“允许同步本地收藏夹到抖音”，再到收藏夹页写回云端。
+        </p>
+      )}
       {loading ? (
         <div className="favorite-loading" role="status">
           <LoaderCircle size={22} className="spin" />
@@ -201,36 +208,44 @@ export function FavoriteDialog({
               </span>
               <input type="checkbox" aria-label="默认收藏列表" checked disabled />
             </label>
-            {editor.folders.map((folder) => (
-              <label className="favorite-folder-row" key={folder.id}>
-                <span className="favorite-folder-cover">
-                  {folder.coverUrl ? (
-                    <img src={folder.coverUrl} alt="" referrerPolicy="no-referrer" />
-                  ) : (
-                    <FolderHeart size={24} />
-                  )}
-                </span>
-                <span className="favorite-folder-name" title={folder.title}>
-                  <span>{folder.title}</span>
-                  {folder.private && <LockKeyhole size={12} aria-label="私密收藏夹" />}
-                  <small>
-                    {folder.localCount}
-                    {folder.localOnly ? ' · 本地' : ''}
-                  </small>
-                </span>
-                <input
-                  type="checkbox"
-                  aria-label={folder.title}
-                  checked={selected.includes(folder.id)}
-                  disabled={busy || needsReload}
-                  onChange={(event) =>
-                    setSelected((ids) =>
-                      event.target.checked ? [...ids, folder.id] : ids.filter((id) => id !== folder.id)
-                    )
-                  }
-                />
-              </label>
-            ))}
+            {editor.folders.map((folder) => {
+              const alreadyAdded = editor.folderIds.includes(folder.id)
+              return (
+                <label
+                  className="favorite-folder-row"
+                  key={folder.id}
+                  title={alreadyAdded ? '该作品已在此收藏夹中' : undefined}
+                >
+                  <span className="favorite-folder-cover">
+                    {folder.coverUrl ? (
+                      <img src={folder.coverUrl} alt="" referrerPolicy="no-referrer" />
+                    ) : (
+                      <FolderHeart size={24} />
+                    )}
+                  </span>
+                  <span className="favorite-folder-name" title={folder.title}>
+                    <span>{folder.title}</span>
+                    {folder.private && <LockKeyhole size={12} aria-label="私密收藏夹" />}
+                    {alreadyAdded && <span className="favorite-folder-badge">已存在</span>}
+                    <small>
+                      {folder.localCount}
+                      {folder.localOnly ? ' · 本地' : ''}
+                    </small>
+                  </span>
+                  <input
+                    type="checkbox"
+                    aria-label={folder.title}
+                    checked={alreadyAdded || selected.includes(folder.id)}
+                    disabled={busy || needsReload || alreadyAdded}
+                    onChange={(event) =>
+                      setSelected((ids) =>
+                        event.target.checked ? [...ids, folder.id] : ids.filter((id) => id !== folder.id)
+                      )
+                    }
+                  />
+                </label>
+              )
+            })}
           </div>
         )
       )}

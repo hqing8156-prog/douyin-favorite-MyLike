@@ -177,12 +177,32 @@ it('counts and stages local-only folders and memberships only for explicit write
 
   expect(store.call('favoriteWriteOps', { accountId: 'a' })).toHaveLength(0)
   expect(store.call('favoriteWritePending', { accountId: 'a' })).toBe(2)
+  expect(store.call('favoriteWritebackPending', { accountId: 'a' })).toEqual({
+    total: 2,
+    items: [
+      expect.objectContaining({
+        kind: 'folder-create',
+        folderTitle: '仅本地',
+        workId: null,
+        queued: false
+      }),
+      expect.objectContaining({
+        kind: 'folder-add',
+        folderTitle: '仅本地',
+        workId: '3',
+        queued: false
+      })
+    ]
+  })
   expect(store.call('favoriteStageLocalFolders', { accountId: 'a', remoteId: 'remote-a' })).toBe(2)
   expect(store.call('favoriteWriteOps', { accountId: 'a' }).map((operation) => operation.kind)).toEqual([
     'folder-create',
     'folder-add'
   ])
   expect(store.call('favoriteWritePending', { accountId: 'a' })).toBe(2)
+  expect(store.call('favoriteWritebackPending', { accountId: 'a' }).items.every((item) => item.queued)).toBe(
+    true
+  )
   expect(store.call('favoriteStageLocalFolders', { accountId: 'a', remoteId: 'remote-a' })).toBe(2)
 })
 it('keeps local folder names as local overrides and hides locally deleted cloud-backed folders', () => {

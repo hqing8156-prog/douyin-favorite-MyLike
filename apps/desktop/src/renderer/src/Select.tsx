@@ -9,10 +9,12 @@ type Props = {
   options: Option[]
   onChange: (value: string) => void
   disabled?: boolean
+  /** Render only the chevron; the selected label stays available via title/aria-label. */
+  hideValue?: boolean
 }
 
 /** Shared select-only combobox. The popover's top layer avoids clipping by scroll containers. */
-export function Select({ label, value, options, onChange, disabled }: Props) {
+export function Select({ label, value, options, onChange, disabled, hideValue }: Props) {
   const id = useId()
   const trigger = useRef<HTMLButtonElement>(null)
   const popup = useRef<HTMLDivElement>(null)
@@ -128,7 +130,7 @@ export function Select({ label, value, options, onChange, disabled }: Props) {
         type="button"
         role="combobox"
         className="select-trigger"
-        aria-label={label}
+        aria-label={hideValue ? `${label}：${options[selected]?.label ?? '未选择'}` : label}
         aria-haspopup="listbox"
         aria-controls={open ? id : undefined}
         aria-expanded={open}
@@ -138,7 +140,7 @@ export function Select({ label, value, options, onChange, disabled }: Props) {
         onKeyDown={keydown}
         title={options[selected]?.label}
       >
-        <span>{options[selected]?.label ?? '请选择'}</span>
+        {!hideValue && <span>{options[selected]?.label ?? '请选择'}</span>}
         <ChevronDown size={14} />
       </button>
       {open && (

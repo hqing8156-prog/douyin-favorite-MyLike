@@ -388,8 +388,16 @@ export class Store {
         return this.favorites.queueWrite(input)
       case 'favoriteWritePending':
         return this.favorites.writePending(input.accountId)
+      case 'favoriteWritebackPending':
+        return this.favorites.writebackPending(input.accountId)
       case 'favoriteFolderWorkIds':
         return this.favorites.folderWorkIds(input)
+      case 'favoriteFolderUnsyncedWorkIds':
+        return this.favorites.folderUnsyncedWorkIds(input)
+      case 'favoriteFolderMemberships':
+        return this.favorites.folderMemberships(input)
+      case 'favoriteFolderWorks':
+        return this.favorites.folderWorks(input)
       case 'favoriteStageLocalFolders':
         return this.favorites.stageLocalFolders(input)
       case 'favoriteWriteOps':

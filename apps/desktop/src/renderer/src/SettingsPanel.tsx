@@ -58,7 +58,7 @@ const groups = [
     title: '通用',
     icon: Settings2,
     keywords:
-      '通用 外观 主题 白天 黑夜 启动 默认 页面 界面 缩放 字体 窗口 记忆 位置 尺寸 动画 AI DeepSeek SiliconFlow 收藏夹 分类 云端 写回 同步 批次 间隔 自动续批'
+      '通用 外观 主题 白天 黑夜 启动 默认 页面 界面 缩放 字体 窗口 记忆 位置 尺寸 动画 AI DeepSeek SiliconFlow 收藏夹 分类 云端 写回 同步 批次 间隔 自动续批 画面 识别 关键帧 风控 视频'
   },
   {
     id: 'playback',
@@ -139,13 +139,11 @@ export function SettingsPanel({
   const application = snapshot?.appPreferences ?? appPreferencesSchema.parse({})
   const [deepseekApiKey, setDeepseekApiKey] = useState('')
   const [siliconFlowApiKey, setSiliconFlowApiKey] = useState('')
-  const [favoriteCategoryHints, setFavoriteCategoryHints] = useState('')
   const [batchIntervalDraft, setBatchIntervalDraft] = useState(String(application.writebackBatchIntervalSec))
   useEffect(() => {
     setDeepseekApiKey(application.deepseekApiKey)
     setSiliconFlowApiKey(application.siliconFlowApiKey)
-    setFavoriteCategoryHints(application.favoriteCategoryHints)
-  }, [application.deepseekApiKey, application.siliconFlowApiKey, application.favoriteCategoryHints])
+  }, [application.deepseekApiKey, application.siliconFlowApiKey])
   useEffect(() => {
     setBatchIntervalDraft(String(application.writebackBatchIntervalSec))
   }, [application.writebackBatchIntervalSec])
@@ -319,7 +317,10 @@ export function SettingsPanel({
                 onChange={(event) => setDeepseekApiKey(event.target.value)}
               />
             </Row>
-            <Row label="SiliconFlow API Key" description="用于视频语音转文字，仅保存在本机">
+            <Row
+              label="SiliconFlow API Key"
+              description="用于短标题视频的语音识别，以及开启下方“逐条识别视频画面”后的关键帧识别；画面描述和转写文本会发送给 SiliconFlow，本机需安装 FFmpeg，Key 仅保存在本机。连接测试验证 Key，模型权限以实际调用为准"
+            >
               <input
                 type="password"
                 aria-label="SiliconFlow API Key"
@@ -329,15 +330,13 @@ export function SettingsPanel({
               />
             </Row>
             <Row
-              label="优先使用的收藏夹名称"
-              description="每行一个；仅在名称与本次选择的收藏夹匹配时使用。要新建的 AI 收藏夹名称请在分类弹窗中填写"
+              label="自动分类时逐条识别视频画面"
+              description="开启后，每条视频会额外请求一次抖音详情并读取视频片段提取关键帧，发送给 SiliconFlow 生成画面描述；视频多时请求密集，可能提高平台风控风险。关闭后只用标题、作者和文案分类，不读取画面（短标题的语音识别仍按 SiliconFlow Key 单独进行）"
             >
-              <textarea
-                aria-label="优先使用的收藏夹名称"
-                value={favoriteCategoryHints}
-                placeholder={'旅行\n音乐\n学习'}
-                rows={4}
-                onChange={(event) => setFavoriteCategoryHints(event.target.value)}
+              <Toggle
+                label="自动分类时逐条识别视频画面"
+                value={application.aiVideoInspection}
+                change={(aiVideoInspection) => updateApplication({ aiVideoInspection })}
               />
             </Row>
             <div className="panel-actions">
@@ -345,8 +344,7 @@ export function SettingsPanel({
                 onClick={() => {
                   updateApplication({
                     deepseekApiKey,
-                    siliconFlowApiKey,
-                    favoriteCategoryHints
+                    siliconFlowApiKey
                   })
                   notice('API 设置已保存。')
                 }}
@@ -358,7 +356,7 @@ export function SettingsPanel({
                   void perform('测试 DeepSeek 连接', async () => {
                     await call(
                       window.mylike.invoke('appPreferences', {
-                        preferences: { deepseekApiKey, siliconFlowApiKey, favoriteCategoryHints }
+                        preferences: { deepseekApiKey, siliconFlowApiKey }
                       })
                     )
                     await call(window.mylike.invoke('aiTestConnection', { provider: 'deepseek' }))
@@ -373,11 +371,11 @@ export function SettingsPanel({
                   void perform('测试 SiliconFlow 连接', async () => {
                     await call(
                       window.mylike.invoke('appPreferences', {
-                        preferences: { deepseekApiKey, siliconFlowApiKey, favoriteCategoryHints }
+                        preferences: { deepseekApiKey, siliconFlowApiKey }
                       })
                     )
                     await call(window.mylike.invoke('aiTestConnection', { provider: 'siliconflow' }))
-                    notice('SiliconFlow 连接测试成功。')
+                    notice('SiliconFlow API Key 验证成功；模型权限以实际调用为准。')
                   })
                 }
               >
@@ -516,6 +514,19 @@ export function SettingsPanel({
             <DataPanel
               accountId={account?.id ?? null}
               perform={perform}
+              coverRefresh={
+                snapshot?.coverRefresh?.accountId === account?.id ? (snapshot?.coverRefresh ?? null) : null
+              }
+              durationRefresh={
+                snapshot?.durationRefresh?.accountId === account?.id
+                  ? (snapshot?.durationRefresh ?? null)
+                  : null
+              }
+              authorIdRefresh={
+                snapshot?.authorIdRefresh?.accountId === account?.id
+                  ? (snapshot?.authorIdRefresh ?? null)
+                  : null
+              }
               coverCachePath={application.coverCachePath}
               updateCoverCachePath={(coverCachePath) => updateApplication({ coverCachePath })}
             />

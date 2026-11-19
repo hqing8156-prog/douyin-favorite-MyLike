@@ -1,5 +1,5 @@
 import { useEffect, useState } from 'react'
-import { FolderPlus, Play, ScanSearch, Sparkles, Square } from 'lucide-react'
+import { FolderPlus, Play, Sparkles, Square } from 'lucide-react'
 import './tasks.css'
 import type { FavoriteFolder, FavoritesTask, Snapshot } from '../../shared/contracts'
 import { CollectionActions } from './CollectionActions'
@@ -9,12 +9,6 @@ import { RuntimeHistory } from './RuntimeHistory'
 import { FavoriteIssues } from './FavoritesPanel'
 import { Select } from './Select'
 import { call, type Perform } from './api'
-
-function formatRemainingTime(progress: { current: number; total: number; startedAt: number }): string {
-  const elapsed = Date.now() - progress.startedAt
-  const remaining = Math.ceil(((elapsed / progress.current) * (progress.total - progress.current)) / 60_000)
-  return remaining < 1 ? '不到 1 分钟' : `约 ${remaining} 分钟`
-}
 
 const activityText: Record<
   NonNullable<Snapshot['favoritesActivity']> | NonNullable<Snapshot['collectionActivity']>,
@@ -35,10 +29,6 @@ export function ConnectionPanel({
   operationBusy,
   login,
   probe,
-  scanTextWorks,
-  textScanStatus,
-  textScan,
-  stopTextScan,
   perform,
   openClassification,
   folders = [],
@@ -50,10 +40,6 @@ export function ConnectionPanel({
   operationBusy: boolean
   login: () => void
   probe: () => void
-  scanTextWorks: (source: 'likes' | 'favorites') => void
-  textScanStatus?: 'running' | 'completed' | 'stopped'
-  textScan: Snapshot['textScan']
-  stopTextScan: () => void
   perform: Perform
   openClassification: (source: 'likes' | 'favorites') => void
   folders?: FavoriteFolder[]
@@ -118,7 +104,9 @@ export function ConnectionPanel({
       : sync
         ? '正在核对，预计完成时间计算中…'
         : lastSync?.status === 'completed'
-          ? `上次写回已完成（${clock(lastSync.at)}）`
+          ? `${pendingWrites ? '最近一批' : '写回'}已完成（${clock(lastSync.at)}）${
+              lastSync.message ? `；${lastSync.message}` : ''
+            }${pendingWrites ? `；仍有 ${pendingWrites} 项待写回` : ''}`
           : lastSync?.status === 'stopped'
             ? '上次写回已停止'
             : lastSync?.status === 'failed'
@@ -378,52 +366,6 @@ export function ConnectionPanel({
             ) : aiRunning ? (
               <div className="task-working" role="progressbar" aria-label="AI 自动分类进度" />
             ) : null}
-          </section>
-          <section className="simple-task" aria-label="扫描文字作品">
-            <div className="simple-task-heading">
-              <h2>扫描文字作品</h2>
-              <span className="task-badge">
-                {textScanStatus === 'running'
-                  ? '进行中'
-                  : textScanStatus === 'completed'
-                    ? '已完成'
-                    : textScanStatus === 'stopped'
-                      ? '已停止'
-                      : '未开始'}
-              </span>
-            </div>
-            <div className="simple-task-body">
-              <div className="simple-task-copy">
-                <p>批量读取已保存作品详情，识别并标记文字作品</p>
-                {textScanStatus === 'running' && (
-                  <span className="task-activity">
-                    正在扫描 {textScan?.current ?? 0}/{textScan?.total ?? '…'} 条
-                    {textScan && textScan.current > 0 && textScan.total > textScan.current
-                      ? `，预计剩余 ${formatRemainingTime(textScan)}`
-                      : ''}
-                  </span>
-                )}
-              </div>
-              <div className="simple-task-actions">
-                <button disabled={!accountId || busy} onClick={() => scanTextWorks('likes')}>
-                  <ScanSearch size={15} />
-                  扫描喜欢
-                </button>
-                <button disabled={!accountId || busy} onClick={() => scanTextWorks('favorites')}>
-                  <ScanSearch size={15} />
-                  扫描收藏
-                </button>
-                {textScanStatus === 'running' && (
-                  <button className="task-text-button" disabled={!accountId} onClick={stopTextScan}>
-                    <Square size={15} />
-                    停止扫描
-                  </button>
-                )}
-              </div>
-            </div>
-            {textScanStatus === 'running' && (
-              <div className="task-working" role="progressbar" aria-label="扫描文字作品进度" />
-            )}
           </section>
         </div>
         <UnlikePanel

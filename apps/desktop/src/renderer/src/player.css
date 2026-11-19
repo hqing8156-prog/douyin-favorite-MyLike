@@ -104,6 +104,7 @@
   min-width: 0;
   min-height: 0;
   overflow: hidden;
+  container-type: size;
   background: radial-gradient(ellipse at center, #26262b 0%, #17171a 50%, #111113 85%);
 }
 .gallery-progress {
@@ -116,6 +117,12 @@
   gap: 3px;
   height: 20px;
   padding: 0;
+  cursor: grab;
+  touch-action: pan-y;
+  user-select: none;
+}
+.gallery-progress:active {
+  cursor: grabbing;
 }
 .gallery-progress-segment {
   position: relative;
@@ -128,7 +135,7 @@
   border-radius: 2px;
   overflow: hidden;
   background: #ffffff55;
-  cursor: pointer;
+  cursor: inherit;
 }
 .gallery-progress-segment::after {
   content: '';
@@ -191,6 +198,53 @@
   display: block;
   transform: translateZ(0);
   transition: opacity 0.1s ease;
+}
+.stage[data-rotation='90'] > video,
+.stage[data-rotation='270'] > video,
+.stage[data-rotation='90'] > .video-surface > video,
+.stage[data-rotation='270'] > .video-surface > video,
+.stage[data-rotation='90'] > .gallery-image,
+.stage[data-rotation='270'] > .gallery-image {
+  top: 50%;
+  right: auto;
+  bottom: auto;
+  left: 50%;
+  width: 100cqh !important;
+  height: 100cqw !important;
+  max-width: none;
+  max-height: none;
+}
+.stage[data-rotation='180'] > video,
+.stage[data-rotation='180'] > .video-surface > video,
+.stage[data-rotation='180'] > .gallery-image {
+  top: 50%;
+  right: auto;
+  bottom: auto;
+  left: 50%;
+}
+.stage[data-rotation='90'] > video,
+.stage[data-rotation='90'] > .video-surface > video,
+.stage[data-rotation='90'] > .gallery-image {
+  transform: translate(-50%, -50%) rotate(90deg) translateZ(0);
+  transition:
+    opacity 0.1s ease,
+    transform 0.18s ease;
+}
+.stage[data-rotation='180'] > video,
+.stage[data-rotation='180'] > .video-surface > video,
+.stage[data-rotation='180'] > .gallery-image {
+  transform: translate(-50%, -50%) rotate(180deg) translateZ(0);
+  transition:
+    opacity 0.1s ease,
+    transform 0.18s ease;
+}
+.stage[data-rotation='270'] > video,
+.stage[data-rotation='270'] > .video-surface > video,
+.stage[data-rotation='270'] > .gallery-image {
+  transform: translate(-50%, -50%) rotate(270deg) translateZ(0);
+  transition:
+    opacity 0.1s ease,
+    transform 0.18s ease;
 }
 .video-surface > video.live-resting {
   opacity: 0;
@@ -370,7 +424,7 @@
 }
 .media-caption {
   position: absolute;
-  z-index: 1;
+  z-index: 3;
   left: 0;
   right: 0;
   bottom: 0;
@@ -496,7 +550,7 @@
   width: 17px;
   height: 17px;
 }
-.playback-controls .unlike-control {
+.playback-controls .unlike-control.is-liked {
   color: #ff6683;
 }
 .playback-controls .favorite-control.is-collected {

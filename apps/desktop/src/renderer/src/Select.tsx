@@ -1,20 +1,41 @@
-import { useEffect, useId, useLayoutEffect, useRef, useState, type KeyboardEvent } from 'react'
+import {
+  useEffect,
+  useId,
+  useLayoutEffect,
+  useRef,
+  useState,
+  type KeyboardEvent,
+  type ReactNode
+} from 'react'
 import { Check, ChevronDown } from 'lucide-react'
 import './select.css'
 
-type Option = { value: string; label: string; disabled?: boolean }
+type Option = { value: string; label: string; disabled?: boolean; displayLabel?: ReactNode }
 type Props = {
   label: string
   value: string
   options: Option[]
   onChange: (value: string) => void
   disabled?: boolean
+  onSelect?: (value: string) => void
+  optionActions?: (option: Option) => ReactNode
+  popupMinWidth?: number
   /** Render only the chevron; the selected label stays available via title/aria-label. */
   hideValue?: boolean
 }
 
 /** Shared select-only combobox. The popover's top layer avoids clipping by scroll containers. */
-export function Select({ label, value, options, onChange, disabled, hideValue }: Props) {
+export function Select({
+  label,
+  value,
+  options,
+  onChange,
+  disabled,
+  hideValue,
+  onSelect,
+  optionActions,
+  popupMinWidth
+}: Props) {
   const id = useId()
   const trigger = useRef<HTMLButtonElement>(null)
   const popup = useRef<HTMLDivElement>(null)
@@ -28,6 +49,7 @@ export function Select({ label, value, options, onChange, disabled, hideValue }:
     if (!option || option.disabled) return
     setOpen(false)
     trigger.current?.focus()
+    onSelect?.(option.value)
     if (option.value !== value) onChange(option.value)
   }
   useEffect(() => {
@@ -52,7 +74,7 @@ export function Select({ label, value, options, onChange, disabled, hideValue }:
       const below = innerHeight - rect.bottom - 14
       const up = below < Math.min(180, options.length * 36 + 12) && above > below
       const height = Math.max(36, Math.min(320, up ? above : below))
-      const width = Math.min(Math.max(rect.width, 180), innerWidth - 16)
+      const width = Math.min(Math.max(rect.width, popupMinWidth ?? 180), innerWidth - 16)
       Object.assign(node.style, {
         width: `${width}px`,
         maxHeight: `${height}px`,
@@ -79,7 +101,7 @@ export function Select({ label, value, options, onChange, disabled, hideValue }:
       window.removeEventListener('resize', position)
       document.removeEventListener('scroll', scroll, true)
     }
-  }, [open, signature])
+  }, [open, signature, popupMinWidth])
   useEffect(() => {
     if (open) popup.current?.querySelector(`[data-index="${active}"]`)?.scrollIntoView({ block: 'nearest' })
   }, [open, active])
@@ -146,31 +168,53 @@ export function Select({ label, value, options, onChange, disabled, hideValue }:
       {open && (
         <div
           ref={popup}
-          id={id}
           popover="manual"
-          role="listbox"
           aria-label={label}
           className="select-popup"
-          onPointerDown={(event) => event.preventDefault()}
+          onPointerDown={(event) => {
+            if (!(event.target as Element).closest('.select-option-actions')) event.preventDefault()
+          }}
         >
-          {options.map((option, index) => (
-            <div
-              key={option.value}
-              role="option"
-              id={`${id}-${index}`}
-              data-index={index}
-              aria-selected={option.value === value}
-              aria-disabled={!!option.disabled}
-              className={`select-option${index === active ? ' is-active' : ''}`}
-              onPointerMove={() => {
-                if (!option.disabled) setActive(index)
-              }}
-              onClick={() => choose(index)}
-            >
-              <span>{option.label}</span>
-              {option.value === value && <Check size={14} />}
-            </div>
-          ))}
+          <div id={id} role="listbox" aria-label={label}>
+            {options.map((option, index) => {
+              const actions = optionActions?.(option)
+              return (
+                <div key={option.value} className="select-option-row" data-index={index}>
+                  <div
+                    role="option"
+                    id={`${id}-${index}`}
+                    aria-label={option.label}
+                    aria-selected={option.value === value}
+                    aria-disabled={!!option.disabled}
+                    className={`select-option${index === active ? ' is-active' : ''}`}
+                    onPointerMove={() => {
+                      if (!option.disabled) setActive(index)
+                    }}
+                    onClick={() => choose(index)}
+                  >
+                    {option.displayLabel ? (
+                      <span className="select-option-label">{option.displayLabel}</span>
+                    ) : (
+                      <span>{option.label}</span>
+                    )}
+                    {option.value === value && <Check size={14} />}
+                  </div>
+                  {actions && (
+                    <span
+                      className="select-option-actions"
+                      onClick={(event) => {
+                        event.stopPropagation()
+                        setOpen(false)
+                        trigger.current?.focus()
+                      }}
+                    >
+                      {actions}
+                    </span>
+                  )}
+                </div>
+              )
+            })}
+          </div>
         </div>
       )}
     </>

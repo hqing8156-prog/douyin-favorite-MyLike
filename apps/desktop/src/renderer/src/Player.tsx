@@ -14,13 +14,14 @@ import {
   ListVideo,
   Maximize,
   Minimize,
+  RotateCw,
   RotateCcw,
   HeartOff,
   Star,
   MessageCircle,
   X
 } from 'lucide-react'
-import type { PlaybackPosition, PlaybackPreferences } from '../../shared/contracts'
+import type { PlaybackPosition, PlaybackPreferences, UnlikeTask } from '../../shared/contracts'
 import type { Playback } from './usePlayback'
 import { QueuePanel } from './QueuePanel'
 import { CommentsPanel } from './CommentsPanel'
@@ -39,10 +40,18 @@ type Props = {
   operationError: string
   clearError: () => void
   login: () => void
-  openAuthor: (authorId: string | null, author: string, workId: string, accountId: string | null) => void
+  openAuthor: (
+    authorId: string | null,
+    author: string,
+    workId: string,
+    accountId: string | null,
+    authorUrl?: string | null
+  ) => void
   copyAuthor: (author: string) => void
   unlike: (source?: 'likes' | 'favorites') => void
   unlikeBusy: boolean
+  unlikeTask: UnlikeTask | null
+  reportError: (message: string) => void
   libraryRevision: number
   cloudSyncEnabled: boolean
   queueOpen: boolean
@@ -67,6 +76,8 @@ export function Player({
   copyAuthor,
   unlike,
   unlikeBusy,
+  unlikeTask,
+  reportError,
   libraryRevision,
   cloudSyncEnabled,
   queueOpen,
@@ -83,6 +94,7 @@ export function Player({
   const stage = useRef<HTMLElement>(null),
     video = useRef<HTMLVideoElement>(null),
     poster = useRef<HTMLImageElement>(null),
+    preloadedImage = useRef<HTMLImageElement | null>(null),
     music = useRef<HTMLAudioElement>(null)
   const [image, setImage] = useState(queue.position.slide),
     [candidate, setCandidate] = useState(0),
@@ -98,10 +110,45 @@ export function Player({
     [videoDuration, setVideoDuration] = useState(0),
     [musicWarning, setMusicWarning] = useState('')
   const [captionExpanded, setCaptionExpanded] = useState(false)
+  const [rotation, setRotation] = useState(0)
   const [commentsOpen, setCommentsOpen] = useState(false)
   const commentsButton = useRef<HTMLButtonElement>(null)
   const [favoriteOpen, setFavoriteOpen] = useState(false),
-    [collected, setCollected] = useState(false)
+    [collected, setCollected] = useState(false),
+    [liked, setLiked] = useState(true)
+  useEffect(() => setRotation(0), [work.id])
+  useEffect(() => {
+    let current = true
+    setLiked(true)
+    if (!unlikeTask || unlikeTask.source !== 'likes')
+      return () => {
+        current = false
+      }
+    void (async () => {
+      for (let offset = 0; ; offset += 100) {
+        const page = await call(
+          window.mylike.invoke('unlikeItems', {
+            accountId: unlikeTask.accountId,
+            taskId: unlikeTask.id,
+            offset,
+            limit: 100
+          })
+        )
+        if (!current) return
+        if (page.items.some((item) => item.workId === work.id && item.status === 'success')) {
+          setLiked(false)
+          return
+        }
+        if (offset + page.items.length >= page.total) return
+      }
+    })().catch((error) => {
+      if (current)
+        reportError(`读取取消点赞状态失败：${error instanceof Error ? error.message : String(error)}`)
+    })
+    return () => {
+      current = false
+    }
+  }, [work.id, unlikeTask?.id, unlikeTask?.updatedAt, unlikeTask?.source, unlikeTask?.accountId, reportError])
   useEffect(() => {
     let current = true
     void call(window.mylike.invoke('favoriteStatus', { accountId: queue.accountId, workId: work.id }))
@@ -136,6 +183,7 @@ export function Player({
     textCover = textual && !slide ? coverUrl : null,
     captionAuthor = media?.work.author || work.author,
     captionAuthorId = media?.work.authorId ?? work.authorId ?? null,
+    captionAuthorUrl = media?.work.authorUrl ?? work.authorUrl ?? null,
     captionTitle = media?.caption || media?.work.title || work.title,
     captionPublishedAt = media?.work.publishedAt || work.publishedAt
   const position = (): PlaybackPosition => {
@@ -184,7 +232,7 @@ export function Player({
   const changeSlide = (index: number, manual = false) => {
     if (manual) setSlidePinned(true)
     liveHold.current = null
-    setLiveStill(false)
+    setLiveStill(!!media?.images[index]?.liveUrl)
     elapsed.current = 0
     setGalleryElapsed(0)
     resumeVideo.current = 0
@@ -218,8 +266,21 @@ export function Player({
       const index = Math.min(queue.position.slide, Math.max(0, media.images.length - 1))
       setImage(index)
       imageRef.current = index
+      setLiveStill(!!media.images[index]?.liveUrl)
     }
   }, [media])
+  useEffect(() => {
+    const next = gallery && media ? media.images[image + 1] : undefined
+    if (!next) return
+    const preload = new Image()
+    preload.decoding = 'async'
+    preload.fetchPriority = 'low'
+    preload.src = next.url
+    preloadedImage.current = preload
+    return () => {
+      if (preloadedImage.current === preload) preloadedImage.current = null
+    }
+  }, [gallery, image, media])
   useEffect(() => {
     if (video.current) {
       video.current.volume = preferences.volume
@@ -497,7 +558,7 @@ export function Player({
         </div>
       )}
       <div className="player-body">
-        <div className="stage">
+        <div className="stage" data-rotation={rotation}>
           {coverUrl && textual && (
             <div className="player-backdrop" style={{ backgroundImage: `url("${coverUrl}")` }} aria-hidden />
           )}
@@ -717,6 +778,7 @@ export function Player({
             <MediaCaption
               author={captionAuthor}
               authorId={captionAuthorId}
+              authorUrl={captionAuthorUrl}
               workId={work.id}
               accountId={queue.accountId}
               title={captionTitle}
@@ -850,6 +912,30 @@ export function Player({
               />
               清屏
             </label>
+            <button
+              className="rotate-control"
+              aria-label="顺时针旋转画面90度"
+              title={`顺时针旋转画面90度（当前${rotation}度）`}
+              aria-pressed={rotation !== 0}
+              onClick={() => setRotation((angle) => (angle + 90) % 360)}
+            >
+              <RotateCw size={19} />
+            </button>
+            {(!queue.source || queue.source === 'likes') && (
+              <button
+                className={`unlike-control${liked ? ' is-liked' : ''}`}
+                aria-label="取消当前点赞"
+                aria-pressed={liked}
+                title={hint('unlike', '取消当前点赞（需确认）')}
+                disabled={unlikeBusy}
+                onClick={() => {
+                  pause()
+                  unlike()
+                }}
+              >
+                <HeartOff size={19} />
+              </button>
+            )}
             {(!queue.source || queue.source === 'likes' || queue.source === 'favorites') && (
               <button
                 className={`favorite-control${collected ? ' is-collected' : ''}`}
@@ -874,20 +960,6 @@ export function Player({
                 }}
               >
                 <Star size={19} fill="currentColor" />
-              </button>
-            )}
-            {(!queue.source || queue.source === 'likes') && (
-              <button
-                className="unlike-control"
-                aria-label="取消当前点赞"
-                title={hint('unlike', '取消当前点赞（需确认）')}
-                disabled={unlikeBusy}
-                onClick={() => {
-                  pause()
-                  unlike()
-                }}
-              >
-                <HeartOff size={19} />
               </button>
             )}
             <button

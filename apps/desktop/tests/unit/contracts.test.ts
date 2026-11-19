@@ -24,9 +24,28 @@ it('accepts remote and locally generated folder ids wherever a folder can be cho
   }
 })
 
+it('allows automatic literary classification without a selected folder', () => {
+  expect(() =>
+    commands.aiClassifyFavorites.parse({
+      accountId,
+      folderIds: [],
+      createAiFolders: false,
+      aiFolderNames: []
+    })
+  ).not.toThrow()
+})
+
 it('rejects folder ids that could not come from the local store', () => {
   expect(() =>
     commands.favoriteFolderRemoveWorks.parse({ accountId, folderId: 'bad id!', workIds: ['1'] })
   ).toThrow()
   expect(() => filterSchema.parse({ accountId, folderId: 'x'.repeat(101) })).toThrow()
+})
+
+it('validates custom video duration thresholds in milliseconds', () => {
+  expect(filterSchema.parse({ accountId, durationGreaterThanMs: 90_000 })).toMatchObject({
+    durationGreaterThanMs: 90_000
+  })
+  expect(() => filterSchema.parse({ accountId, durationGreaterThanMs: -1 })).toThrow()
+  expect(() => filterSchema.parse({ accountId, durationGreaterThanMs: 86_400_001 })).toThrow()
 })

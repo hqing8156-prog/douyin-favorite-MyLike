@@ -1,5 +1,6 @@
 import { app, shell } from 'electron'
-import { mkdir, readdir, stat } from 'node:fs/promises'
+import { spawn } from 'node:child_process'
+import { access, mkdir, readdir, stat, writeFile } from 'node:fs/promises'
 import { join } from 'node:path'
 import type { DataInfo } from '../shared/contracts'
 import { AppError } from './errors'
@@ -43,6 +44,39 @@ export class DataMaintenance {
     await mkdir(folder, { recursive: true })
     if (await shell.openPath(folder))
       throw new AppError('OPEN_FOLDER_FAILED', '无法打开数据目录，请稍后重试。')
+    return null
+  }
+  async openLog(name: 'cover-refresh' | 'duration-refresh'): Promise<null> {
+    const folder = join(app.getPath('userData'), 'logs')
+    await mkdir(folder, { recursive: true })
+    const file = join(folder, `${name}.log`)
+    try {
+      await access(file)
+    } catch {
+      await writeFile(file, '', 'utf8')
+    }
+    if (process.platform === 'win32') {
+      try {
+        const child = spawn('notepad.exe', [file], { detached: true, stdio: 'ignore' })
+        await new Promise<void>((resolve, reject) => {
+          const settle = (error?: Error) => {
+            child.removeListener('spawn', onSpawn)
+            child.removeListener('error', onError)
+            if (error) reject(error)
+            else resolve()
+          }
+          const onSpawn = () => settle()
+          const onError = (error: Error) => settle(error)
+          child.once('spawn', onSpawn)
+          child.once('error', onError)
+        })
+        child.unref()
+        return null
+      } catch {
+        // Fall back to the system association when notepad.exe is unavailable.
+      }
+    }
+    if (await shell.openPath(file)) throw new AppError('OPEN_LOG_FAILED', '无法打开日志文件，请稍后重试。')
     return null
   }
 }

@@ -11,7 +11,9 @@ export class LogFile {
         await mkdir(this.directory, { recursive: true })
         await appendFile(join(this.directory, file), line + '\n', 'utf8')
       })
-      .catch(() => {})
+      .catch((error: unknown) => {
+        console.error(`[MyLike] Failed to append local log file "${file}".`, error)
+      })
     return this.pending
   }
 }

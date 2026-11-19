@@ -6,7 +6,16 @@ import { DatabaseSync } from 'node:sqlite'
 import { mkdirSync, renameSync, unlinkSync } from 'node:fs'
 import { dirname, join } from 'node:path'
 import { randomUUID } from 'node:crypto'
-import type { Account, CollectionTask, Filter, Query, Work } from '../../shared/contracts'
+import type {
+  Account,
+  AuthorIdRefreshCheckpoint,
+  CollectionTask,
+  CoverRefreshCheckpoint,
+  DurationRefreshCheckpoint,
+  Filter,
+  Query,
+  Work
+} from '../../shared/contracts'
 import { MAX_BATCH_SIZE } from '../../shared/contracts'
 import type { Inputs, Replies } from './protocol'
 import { AppError } from '../errors'
@@ -26,7 +35,7 @@ export class Store {
     try {
       this.db.exec('PRAGMA foreign_keys=ON; PRAGMA busy_timeout=5000;')
       const version = this.db.prepare('PRAGMA user_version').get() as { user_version: number }
-      if (version.user_version > 8) throw new Error('Database version is newer than this application')
+      if (version.user_version > 17) throw new Error('Database version is newer than this application')
       this.db.exec('PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL;')
       if (version.user_version > 0 && version.user_version < 6) {
         this.backup('before-v6')
@@ -100,6 +109,94 @@ export class Store {
           this.db.exec('ALTER TABLE works ADD COLUMN authorId TEXT;')
         this.db.exec('PRAGMA user_version=8; COMMIT;')
       }
+      if (version.user_version < 9)
+        this.db.exec(`
+          BEGIN IMMEDIATE;
+          CREATE TABLE cover_refresh_tasks (
+            accountId TEXT PRIMARY KEY REFERENCES accounts(id) ON DELETE CASCADE,
+            workIds TEXT NOT NULL,
+            nextIndex INTEGER NOT NULL,
+            updated INTEGER NOT NULL,
+            failed INTEGER NOT NULL,
+            lastRequestAt INTEGER NOT NULL,
+            pauseReason TEXT CHECK(pauseReason IS NULL OR pauseReason IN ('verification','limited','manual')),
+            updatedAt INTEGER NOT NULL
+          );
+          PRAGMA user_version=9;
+          COMMIT;
+        `)
+      if (version.user_version < 10)
+        this.db.exec(`
+          BEGIN IMMEDIATE;
+          CREATE TABLE cover_refresh_completed (
+            accountId TEXT NOT NULL REFERENCES accounts(id) ON DELETE CASCADE,
+            workId TEXT NOT NULL REFERENCES works(id) ON DELETE CASCADE,
+            updatedAt INTEGER NOT NULL,
+            PRIMARY KEY(accountId,workId)
+          );
+          PRAGMA user_version=10;
+          COMMIT;
+        `)
+      if (version.user_version < 11) {
+        this.db.exec('BEGIN IMMEDIATE;')
+        const workColumns = this.db.prepare('PRAGMA table_info(works)').all() as { name: string }[]
+        if (!workColumns.some(({ name }) => name === 'durationMs'))
+          this.db.exec('ALTER TABLE works ADD COLUMN durationMs INTEGER NOT NULL DEFAULT 0;')
+        this.db.exec('PRAGMA user_version=11; COMMIT;')
+      }
+      if (version.user_version < 12)
+        this.db.exec(`
+          BEGIN IMMEDIATE;
+          CREATE TABLE IF NOT EXISTS duration_refresh_tasks (
+            accountId TEXT PRIMARY KEY REFERENCES accounts(id) ON DELETE CASCADE,
+            workIds TEXT NOT NULL,
+            nextIndex INTEGER NOT NULL,
+            updated INTEGER NOT NULL,
+            failed INTEGER NOT NULL,
+            lastRequestAt INTEGER NOT NULL,
+            pauseReason TEXT CHECK(pauseReason IS NULL OR pauseReason IN ('verification','limited','manual')),
+            updatedAt INTEGER NOT NULL
+          );
+          PRAGMA user_version=12;
+          COMMIT;
+        `)
+      if (version.user_version < 13)
+        this.db.exec(`
+          BEGIN IMMEDIATE;
+          CREATE TABLE IF NOT EXISTS author_id_refresh_tasks (
+            accountId TEXT PRIMARY KEY REFERENCES accounts(id) ON DELETE CASCADE,
+            workIds TEXT NOT NULL,
+            nextIndex INTEGER NOT NULL,
+            updated INTEGER NOT NULL,
+            failed INTEGER NOT NULL,
+            lastRequestAt INTEGER NOT NULL,
+            pauseReason TEXT CHECK(pauseReason IS NULL OR pauseReason IN ('verification','limited','manual')),
+            updatedAt INTEGER NOT NULL
+          );
+          PRAGMA user_version=13;
+          COMMIT;
+        `)
+      if (version.user_version < 14) {
+        this.db.exec('BEGIN IMMEDIATE;')
+        const workColumns = this.db.prepare('PRAGMA table_info(works)').all() as { name: string }[]
+        if (!workColumns.some(({ name }) => name === 'awemeType'))
+          this.db.exec('ALTER TABLE works ADD COLUMN awemeType INTEGER;')
+        this.db.exec('PRAGMA user_version=14; COMMIT;')
+      }
+      if (version.user_version < 16) {
+        this.db.exec('BEGIN IMMEDIATE;')
+        const workColumns = this.db.prepare('PRAGMA table_info(works)').all() as { name: string }[]
+        if (!workColumns.some(({ name }) => name === 'authorUrl'))
+          this.db.exec('ALTER TABLE works ADD COLUMN authorUrl TEXT;')
+        this.db.exec('PRAGMA user_version=16; COMMIT;')
+      }
+      if (version.user_version < 17)
+        this.db.exec(`
+          BEGIN IMMEDIATE;
+          DROP TABLE IF EXISTS text_scan_scanned;
+          PRAGMA user_version=17;
+          COMMIT;
+        `)
       this.db.exec('BEGIN IMMEDIATE; ' + favoriteStateSchema + ' COMMIT;')
       const favoriteState = new FavoriteState(this.db)
       const favoriteTasks = this.db.prepare('SELECT id FROM saved_tasks').all()
@@ -200,7 +297,7 @@ export class Store {
     if (this.account(input.accountId).remoteId !== input.remoteId)
       throw new AppError('IDENTITY_MISMATCH', '账号身份发生变化，本页未保存。')
     const work = this.db.prepare(
-      'INSERT INTO works(id,title,author,publishedAt,coverUrl,mediaType,isLive,authorId) VALUES(?,?,?,?,?,?,?,?) ON CONFLICT(id) DO UPDATE SET title=excluded.title,author=excluded.author,publishedAt=excluded.publishedAt,coverUrl=coalesce(excluded.coverUrl,works.coverUrl),mediaType=excluded.mediaType,isLive=excluded.isLive,authorId=coalesce(excluded.authorId,works.authorId)'
+      "INSERT INTO works(id,title,author,publishedAt,coverUrl,mediaType,isLive,authorId,authorUrl,durationMs,awemeType) VALUES(?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(id) DO UPDATE SET title=excluded.title,author=excluded.author,publishedAt=excluded.publishedAt,coverUrl=coalesce(excluded.coverUrl,works.coverUrl),mediaType=CASE WHEN works.mediaType='text' THEN 'text' ELSE excluded.mediaType END,isLive=excluded.isLive,authorId=coalesce(excluded.authorId,works.authorId),authorUrl=coalesce(excluded.authorUrl,works.authorUrl),durationMs=CASE WHEN excluded.durationMs>0 THEN excluded.durationMs ELSE works.durationMs END,awemeType=coalesce(excluded.awemeType,works.awemeType)"
     )
     const member = this.db.prepare(
       'INSERT OR IGNORE INTO account_items(accountId,workId,firstSeen,platformSeen) VALUES(?,?,?,1)'
@@ -222,7 +319,10 @@ export class Store {
         item.coverUrl,
         item.mediaType,
         +item.isLive,
-        item.authorId ?? null
+        item.authorId ?? null,
+        item.authorUrl ?? null,
+        item.durationMs ?? 0,
+        item.awemeType ?? null
       )
       added += Number(member.run(input.accountId, item.id, Date.now()).changes)
       mark.run(input.accountId, item.id)
@@ -384,6 +484,10 @@ export class Store {
         return this.favorites.localFolderEdit(input)
       case 'favoriteLocalFolderDelete':
         return this.favorites.localFolderDelete(input)
+      case 'favoriteCloudFolderEdit':
+        return this.favorites.cloudFolderEdit(input)
+      case 'favoriteCloudFolderDelete':
+        return this.favorites.cloudFolderDelete(input)
       case 'favoriteQueueWrite':
         return this.favorites.queueWrite(input)
       case 'favoriteWritePending':
@@ -404,6 +508,8 @@ export class Store {
         return this.favorites.writeOps(input.accountId)
       case 'favoriteWriteComplete':
         return this.favorites.writeComplete(input.accountId, input.operationId)
+      case 'favoriteFolderSetRemoteCount':
+        return this.favorites.setRemoteCount(input)
       case 'favoriteLinkFolder':
         return this.favorites.linkFolder(input)
       case 'favoriteStatus':
@@ -472,15 +578,323 @@ export class Store {
         if (!input.workIds.length) return []
         return this.db
           .prepare(
-            `SELECT id,title,author,authorId,publishedAt,coverUrl,mediaType,isLive FROM works
+            `SELECT id,title,author,authorId,authorUrl,publishedAt,coverUrl,mediaType,isLive,durationMs,awemeType FROM works
             WHERE id IN (${input.workIds.map(() => '?').join(',')})`
           )
           .all(...input.workIds) as unknown as Work[]
       }
+      case 'missingCoverWorks': {
+        this.account(input.accountId)
+        return this.db
+          .prepare(
+            `SELECT w.id,w.title,w.author,w.authorId,w.authorUrl,w.publishedAt,w.coverUrl,w.mediaType,w.isLive,w.durationMs,w.awemeType
+            FROM works w
+            WHERE (
+                w.coverUrl IS NULL OR trim(w.coverUrl)='' OR w.isLive=1
+              )
+              AND (
+                EXISTS(SELECT 1 FROM account_items a WHERE a.accountId=? AND a.workId=w.id)
+                OR EXISTS(SELECT 1 FROM saved_items s WHERE s.accountId=? AND s.workId=w.id)
+              )
+              AND NOT EXISTS(
+                SELECT 1 FROM cover_refresh_completed c
+                WHERE c.accountId=? AND c.workId=w.id
+              )
+            ORDER BY w.publishedAt DESC,w.id DESC
+            LIMIT ? OFFSET ?`
+          )
+          .all(input.accountId, input.accountId, input.accountId, input.limit, input.offset)
+          .map((row) => ({ ...row, isLive: !!row.isLive })) as unknown as Work[]
+      }
+      case 'missingDurationWorks': {
+        this.account(input.accountId)
+        return this.db
+          .prepare(
+            `SELECT w.id,w.title,w.author,w.authorId,w.authorUrl,w.publishedAt,w.coverUrl,w.mediaType,w.isLive,w.durationMs,w.awemeType
+            FROM works w
+            WHERE w.mediaType='video' AND w.durationMs<=0
+              AND (
+                EXISTS(SELECT 1 FROM account_items a WHERE a.accountId=? AND a.workId=w.id)
+                OR EXISTS(SELECT 1 FROM saved_items s WHERE s.accountId=? AND s.workId=w.id)
+              )
+            ORDER BY w.publishedAt DESC,w.id DESC
+            LIMIT ? OFFSET ?`
+          )
+          .all(input.accountId, input.accountId, input.limit, input.offset)
+          .map((row) => ({ ...row, isLive: !!row.isLive })) as unknown as Work[]
+      }
+      // Temporarily widened: the author-ID backfill also repairs cover, video
+      // duration and author profile links from the same detail response.
+      case 'missingAuthorIdWorks': {
+        this.account(input.accountId)
+        return this.db
+          .prepare(
+            `SELECT w.id,w.title,w.author,w.authorId,w.authorUrl,w.publishedAt,w.coverUrl,w.mediaType,w.isLive,w.durationMs,w.awemeType
+            FROM works w
+            WHERE (
+                w.authorId IS NULL OR trim(w.authorId)='' OR length(w.authorId) NOT BETWEEN 8 AND 200
+                OR w.authorId GLOB '*[^A-Za-z0-9_-]*'
+                OR w.coverUrl IS NULL OR trim(w.coverUrl)=''
+                OR (w.mediaType='video' AND w.durationMs<=0)
+              )
+              AND (
+                EXISTS(SELECT 1 FROM account_items a WHERE a.accountId=? AND a.workId=w.id)
+                OR EXISTS(SELECT 1 FROM saved_items s WHERE s.accountId=? AND s.workId=w.id)
+              )
+            ORDER BY w.publishedAt DESC,w.id DESC
+            LIMIT ? OFFSET ?`
+          )
+          .all(input.accountId, input.accountId, input.limit, input.offset)
+          .map((row) => ({ ...row, isLive: !!row.isLive })) as unknown as Work[]
+      }
+      case 'authorIdRefreshCheckpoint': {
+        this.account(input.accountId)
+        const row = this.db
+          .prepare(
+            'SELECT workIds,nextIndex,updated,failed,lastRequestAt,pauseReason FROM author_id_refresh_tasks WHERE accountId=?'
+          )
+          .get(input.accountId) as
+          | {
+              workIds: string
+              nextIndex: number
+              updated: number
+              failed: number
+              lastRequestAt: number
+              pauseReason: AuthorIdRefreshCheckpoint['pauseReason']
+            }
+          | undefined
+        if (!row) return null
+        let workIds: unknown
+        try {
+          workIds = JSON.parse(row.workIds)
+        } catch {
+          throw new AppError('DATABASE_CORRUPT', '作者 ID 补全断点无法读取；数据库中的进度已保留。')
+        }
+        if (
+          !Array.isArray(workIds) ||
+          workIds.some((id: unknown) => typeof id !== 'string' || !/^\d{1,30}$/.test(id)) ||
+          new Set(workIds).size !== workIds.length ||
+          !Number.isInteger(row.nextIndex) ||
+          row.nextIndex < 0 ||
+          row.nextIndex > workIds.length ||
+          !Number.isInteger(row.updated) ||
+          row.updated < 0 ||
+          !Number.isInteger(row.failed) ||
+          row.failed < 0 ||
+          !Number.isSafeInteger(row.lastRequestAt) ||
+          row.lastRequestAt < 0 ||
+          ![null, 'verification', 'limited', 'manual'].includes(row.pauseReason)
+        )
+          throw new AppError('DATABASE_CORRUPT', '作者 ID 补全断点无效；数据库中的进度已保留。')
+        return { accountId: input.accountId, ...row, workIds } as AuthorIdRefreshCheckpoint
+      }
+      case 'saveAuthorIdRefreshCheckpoint': {
+        const checkpoint = input.checkpoint
+        this.account(checkpoint.accountId)
+        if (
+          checkpoint.workIds.some((id: string) => !/^\d{1,30}$/.test(id)) ||
+          new Set(checkpoint.workIds).size !== checkpoint.workIds.length ||
+          !Number.isInteger(checkpoint.nextIndex) ||
+          checkpoint.nextIndex < 0 ||
+          checkpoint.nextIndex > checkpoint.workIds.length ||
+          !Number.isInteger(checkpoint.updated) ||
+          checkpoint.updated < 0 ||
+          !Number.isInteger(checkpoint.failed) ||
+          checkpoint.failed < 0 ||
+          !Number.isSafeInteger(checkpoint.lastRequestAt) ||
+          checkpoint.lastRequestAt < 0 ||
+          ![null, 'verification', 'limited', 'manual'].includes(checkpoint.pauseReason)
+        )
+          throw new AppError('INVALID_INPUT', '作者 ID 补全断点无效，未保存。')
+        this.db
+          .prepare(
+            `INSERT INTO author_id_refresh_tasks(accountId,workIds,nextIndex,updated,failed,lastRequestAt,pauseReason,updatedAt)
+            VALUES(?,?,?,?,?,?,?,?) ON CONFLICT(accountId) DO UPDATE SET
+            workIds=excluded.workIds,nextIndex=excluded.nextIndex,updated=excluded.updated,
+            failed=excluded.failed,lastRequestAt=excluded.lastRequestAt,pauseReason=excluded.pauseReason,
+            updatedAt=excluded.updatedAt`
+          )
+          .run(
+            checkpoint.accountId,
+            JSON.stringify(checkpoint.workIds),
+            checkpoint.nextIndex,
+            checkpoint.updated,
+            checkpoint.failed,
+            checkpoint.lastRequestAt,
+            checkpoint.pauseReason,
+            Date.now()
+          )
+        return null
+      }
+      case 'deleteAuthorIdRefreshCheckpoint':
+        this.account(input.accountId)
+        this.db.prepare('DELETE FROM author_id_refresh_tasks WHERE accountId=?').run(input.accountId)
+        return null
+      case 'durationRefreshCheckpoint': {
+        this.account(input.accountId)
+        const row = this.db
+          .prepare(
+            'SELECT workIds,nextIndex,updated,failed,lastRequestAt,pauseReason FROM duration_refresh_tasks WHERE accountId=?'
+          )
+          .get(input.accountId) as
+          | {
+              workIds: string
+              nextIndex: number
+              updated: number
+              failed: number
+              lastRequestAt: number
+              pauseReason: DurationRefreshCheckpoint['pauseReason']
+            }
+          | undefined
+        if (!row) return null
+        let workIds: unknown
+        try {
+          workIds = JSON.parse(row.workIds)
+        } catch {
+          throw new AppError('DATABASE_CORRUPT', '视频时长同步断点无法读取；数据库中的进度已保留。')
+        }
+        if (
+          !Array.isArray(workIds) ||
+          workIds.some((id: unknown) => typeof id !== 'string' || !/^\d{1,30}$/.test(id)) ||
+          new Set(workIds).size !== workIds.length ||
+          !Number.isInteger(row.nextIndex) ||
+          row.nextIndex < 0 ||
+          row.nextIndex > workIds.length ||
+          !Number.isInteger(row.updated) ||
+          row.updated < 0 ||
+          !Number.isInteger(row.failed) ||
+          row.failed < 0 ||
+          !Number.isSafeInteger(row.lastRequestAt) ||
+          row.lastRequestAt < 0 ||
+          ![null, 'verification', 'limited', 'manual'].includes(row.pauseReason)
+        )
+          throw new AppError('DATABASE_CORRUPT', '视频时长同步断点无效；数据库中的进度已保留。')
+        return { accountId: input.accountId, ...row, workIds } as DurationRefreshCheckpoint
+      }
+      case 'saveDurationRefreshCheckpoint': {
+        const checkpoint = input.checkpoint
+        this.account(checkpoint.accountId)
+        if (
+          checkpoint.workIds.some((id: string) => !/^\d{1,30}$/.test(id)) ||
+          new Set(checkpoint.workIds).size !== checkpoint.workIds.length ||
+          !Number.isInteger(checkpoint.nextIndex) ||
+          checkpoint.nextIndex < 0 ||
+          checkpoint.nextIndex > checkpoint.workIds.length ||
+          !Number.isInteger(checkpoint.updated) ||
+          checkpoint.updated < 0 ||
+          !Number.isInteger(checkpoint.failed) ||
+          checkpoint.failed < 0 ||
+          !Number.isSafeInteger(checkpoint.lastRequestAt) ||
+          checkpoint.lastRequestAt < 0 ||
+          ![null, 'verification', 'limited', 'manual'].includes(checkpoint.pauseReason)
+        )
+          throw new AppError('INVALID_INPUT', '视频时长同步断点无效，未保存。')
+        this.db
+          .prepare(
+            `INSERT INTO duration_refresh_tasks(accountId,workIds,nextIndex,updated,failed,lastRequestAt,pauseReason,updatedAt)
+            VALUES(?,?,?,?,?,?,?,?) ON CONFLICT(accountId) DO UPDATE SET
+            workIds=excluded.workIds,nextIndex=excluded.nextIndex,updated=excluded.updated,
+            failed=excluded.failed,lastRequestAt=excluded.lastRequestAt,pauseReason=excluded.pauseReason,
+            updatedAt=excluded.updatedAt`
+          )
+          .run(
+            checkpoint.accountId,
+            JSON.stringify(checkpoint.workIds),
+            checkpoint.nextIndex,
+            checkpoint.updated,
+            checkpoint.failed,
+            checkpoint.lastRequestAt,
+            checkpoint.pauseReason,
+            Date.now()
+          )
+        return null
+      }
+      case 'deleteDurationRefreshCheckpoint':
+        this.account(input.accountId)
+        this.db.prepare('DELETE FROM duration_refresh_tasks WHERE accountId=?').run(input.accountId)
+        return null
+      case 'coverRefreshCheckpoint': {
+        this.account(input.accountId)
+        const row = this.db
+          .prepare(
+            'SELECT workIds,nextIndex,updated,failed,lastRequestAt,pauseReason FROM cover_refresh_tasks WHERE accountId=?'
+          )
+          .get(input.accountId) as
+          | {
+              workIds: string
+              nextIndex: number
+              updated: number
+              failed: number
+              lastRequestAt: number
+              pauseReason: CoverRefreshCheckpoint['pauseReason']
+            }
+          | undefined
+        if (!row) return null
+        let workIds: unknown
+        try {
+          workIds = JSON.parse(row.workIds)
+        } catch {
+          throw new AppError('DATABASE_CORRUPT', '封面补全断点无法读取；数据库中的进度已保留。')
+        }
+        if (
+          !Array.isArray(workIds) ||
+          workIds.some((id: unknown) => typeof id !== 'string' || !/^\d{1,30}$/.test(id)) ||
+          !Number.isInteger(row.nextIndex) ||
+          row.nextIndex < 0 ||
+          row.nextIndex > workIds.length
+        )
+          throw new AppError('DATABASE_CORRUPT', '封面补全断点无效；数据库中的进度已保留。')
+        return { accountId: input.accountId, ...row, workIds } as CoverRefreshCheckpoint
+      }
+      case 'saveCoverRefreshCheckpoint': {
+        const checkpoint = input.checkpoint
+        this.account(checkpoint.accountId)
+        if (
+          checkpoint.workIds.some((id: string) => !/^\d{1,30}$/.test(id)) ||
+          !Number.isInteger(checkpoint.nextIndex) ||
+          checkpoint.nextIndex < 0 ||
+          checkpoint.nextIndex > checkpoint.workIds.length
+        )
+          throw new AppError('INVALID_INPUT', '封面补全断点无效，未保存。')
+        this.db
+          .prepare(
+            `INSERT INTO cover_refresh_tasks(accountId,workIds,nextIndex,updated,failed,lastRequestAt,pauseReason,updatedAt)
+            VALUES(?,?,?,?,?,?,?,?) ON CONFLICT(accountId) DO UPDATE SET
+            workIds=excluded.workIds,nextIndex=excluded.nextIndex,updated=excluded.updated,
+            failed=excluded.failed,lastRequestAt=excluded.lastRequestAt,pauseReason=excluded.pauseReason,
+            updatedAt=excluded.updatedAt`
+          )
+          .run(
+            checkpoint.accountId,
+            JSON.stringify(checkpoint.workIds),
+            checkpoint.nextIndex,
+            checkpoint.updated,
+            checkpoint.failed,
+            checkpoint.lastRequestAt,
+            checkpoint.pauseReason,
+            Date.now()
+          )
+        return null
+      }
+      case 'deleteCoverRefreshCheckpoint':
+        this.account(input.accountId)
+        this.db.prepare('DELETE FROM cover_refresh_tasks WHERE accountId=?').run(input.accountId)
+        return null
+      case 'coverRefreshMarkCompleted':
+        this.account(input.accountId)
+        return this.transaction(() => {
+          const insert = this.db.prepare(
+            `INSERT OR IGNORE INTO cover_refresh_completed(accountId,workId,updatedAt)
+            SELECT ?,?,? WHERE EXISTS(SELECT 1 FROM works WHERE id=?)`
+          )
+          const updatedAt = Date.now()
+          for (const workId of input.workIds) insert.run(input.accountId, workId, updatedAt, workId)
+          return null
+        })
       case 'updateWork':
         this.db
           .prepare(
-            `UPDATE works SET title=?,author=?,publishedAt=?,coverUrl=?,mediaType=?,isLive=?,authorId=coalesce(?,authorId) WHERE id=?`
+            `UPDATE works SET title=?,author=?,publishedAt=?,coverUrl=coalesce(?,coverUrl),mediaType=CASE WHEN ?='text' OR mediaType='text' THEN 'text' ELSE ? END,isLive=?,authorId=coalesce(?,authorId),authorUrl=coalesce(?,authorUrl),durationMs=CASE WHEN ?>0 THEN ? ELSE durationMs END,awemeType=coalesce(?,awemeType) WHERE id=?`
           )
           .run(
             input.work.title,
@@ -488,11 +902,47 @@ export class Store {
             input.work.publishedAt,
             input.work.coverUrl,
             input.work.mediaType,
+            input.work.mediaType,
             +input.work.isLive,
             input.work.authorId ?? null,
+            input.work.authorUrl ?? null,
+            input.work.durationMs ?? 0,
+            input.work.durationMs ?? 0,
+            input.work.awemeType ?? null,
             input.work.id
           )
         return null
+      case 'coverRefreshSaveWork':
+        return this.transaction(() => {
+          this.account(input.accountId)
+          const work = input.work
+          this.db
+            .prepare(
+              `UPDATE works SET title=?,author=?,publishedAt=?,coverUrl=coalesce(?,coverUrl),mediaType=CASE WHEN ?='text' OR mediaType='text' THEN 'text' ELSE ? END,isLive=?,authorId=coalesce(?,authorId),authorUrl=coalesce(?,authorUrl),durationMs=CASE WHEN ?>0 THEN ? ELSE durationMs END,awemeType=coalesce(?,awemeType) WHERE id=?`
+            )
+            .run(
+              work.title,
+              work.author,
+              work.publishedAt,
+              work.coverUrl,
+              work.mediaType,
+              work.mediaType,
+              +work.isLive,
+              work.authorId ?? null,
+              work.authorUrl ?? null,
+              work.durationMs ?? 0,
+              work.durationMs ?? 0,
+              work.awemeType ?? null,
+              work.id
+            )
+          this.db
+            .prepare(
+              `INSERT OR IGNORE INTO cover_refresh_completed(accountId,workId,updatedAt)
+              SELECT ?,?,? WHERE EXISTS(SELECT 1 FROM works WHERE id=?)`
+            )
+            .run(input.accountId, work.id, Date.now(), work.id)
+          return null
+        })
       case 'favoritesStart':
         this.account(input.accountId)
         return this.favorites.start(input.accountId, input.id, input.mode, input.stage)
@@ -783,7 +1233,20 @@ export class Store {
             count(*) AS count ${scope.from} GROUP BY year ORDER BY year DESC`
           )
           .all(...scope.params)
-        return { accountId: input.accountId, ...counts, ...sources, years, recent }
+        const authors = this.db
+          .prepare(
+            `SELECT w.authorId, max(w.author) AS name, count(*) AS total,
+              sum(w.mediaType='video') AS videos,
+              sum(w.mediaType='gallery') AS galleries,
+              sum(w.mediaType='text') AS texts
+            FROM account_items a JOIN works w ON w.id=a.workId
+            WHERE a.accountId=? AND trim(coalesce(w.authorId,''))<>''
+            GROUP BY w.authorId
+            HAVING count(*)>=3
+            ORDER BY total DESC, name COLLATE NOCASE, w.authorId`
+          )
+          .all(input.accountId)
+        return { accountId: input.accountId, ...counts, ...sources, years, recent, authors }
       }
       case 'matchingIds': {
         this.account(input.accountId)
@@ -843,9 +1306,13 @@ export class Store {
       params: (string | number)[] = [query.accountId]
     if (query.search) {
       clauses.push(
-        '(instr(lower(w.id),lower(?))>0 OR instr(lower(w.title),lower(?))>0 OR instr(lower(w.author),lower(?))>0)'
+        "(instr(lower(w.id),lower(?))>0 OR instr(lower(w.title),lower(?))>0 OR instr(lower(w.author),lower(?))>0 OR instr(lower(coalesce(w.authorId,'')),lower(?))>0 OR (trim(coalesce(w.title,''))='' AND instr('未命名作品',lower(?))>0))"
       )
-      params.push(query.search, query.search, query.search)
+      params.push(query.search, query.search, query.search, query.search, query.search)
+    }
+    if (query.durationGreaterThanMs !== undefined && query.durationGreaterThanMs !== null) {
+      clauses.push("w.mediaType='video' AND w.durationMs>?")
+      params.push(query.durationGreaterThanMs)
     }
     if (query.mediaType !== 'all') {
       clauses.push('w.mediaType=?')
@@ -891,7 +1358,14 @@ export class Store {
       .prepare(`SELECT w.* ${from} ${order} LIMIT ? OFFSET ?`)
       .all(...params, query.limit, query.offset)
       .map((row) => ({ ...row, isLive: !!row.isLive }))
-    const yearScope = this.filter({ ...query, search: '', mediaType: 'all', year: null, month: null })
+    const yearScope = this.filter({
+      ...query,
+      search: '',
+      mediaType: 'all',
+      durationGreaterThanMs: null,
+      year: null,
+      month: null
+    })
     const years = this.db
       .prepare(
         `SELECT DISTINCT cast(strftime('%Y',w.publishedAt,'unixepoch','localtime') AS INTEGER) AS year ${yearScope.from} ORDER BY year DESC`

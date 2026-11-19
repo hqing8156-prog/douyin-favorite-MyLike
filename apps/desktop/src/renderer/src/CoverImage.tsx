@@ -1,5 +1,6 @@
 import { useEffect, useState } from 'react'
 import { FolderHeart } from 'lucide-react'
+import type { ReactNode } from 'react'
 
 /**
  * Covers are served through the app protocol so they can be cached on disk:
@@ -7,7 +8,15 @@ import { FolderHeart } from 'lucide-react'
  */
 export const cachedCoverUrl = (url: string): string => `mylike://cover/?url=${encodeURIComponent(url)}`
 
-export function CoverImage({ url, size = 18 }: { url: string | null | undefined; size?: number }) {
+export function CoverImage({
+  url,
+  size = 18,
+  fallback
+}: {
+  url: string | null | undefined
+  size?: number
+  fallback?: ReactNode
+}) {
   const cached = url ? cachedCoverUrl(url) : null
   const [src, setSrc] = useState<string | null>(cached)
   const [failed, setFailed] = useState(false)
@@ -15,7 +24,7 @@ export function CoverImage({ url, size = 18 }: { url: string | null | undefined;
     setSrc(cached)
     setFailed(false)
   }, [cached])
-  if (!url || !src || failed) return <FolderHeart size={size} />
+  if (!url || !src || failed) return fallback === undefined ? <FolderHeart size={size} /> : fallback
   return (
     <img
       src={src}

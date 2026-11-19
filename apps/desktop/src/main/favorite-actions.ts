@@ -29,10 +29,21 @@ type WritebackProgress = {
   scopeRemaining: number
 }
 /** Space between individual platform writes; batch spacing is a separate setting. */
-const WRITEBACK_WRITE_INTERVAL_MS = 350
-type Editor = { scope: Scope; remoteId: string; expires: number; folders: FavoriteFolder[] }
+const WRITEBACK_WRITE_INTERVAL_MS = 1000
+function folderSecret(folder: FavoriteFolder): string {
+  if (folder.private === undefined)
+    throw new AppError('FOLDER_CHANGED', '无法确认云端收藏夹的隐私状态，请重新核实收藏夹后重试。')
+  return folder.private ? '1' : '0'
+}
+type Editor = {
+  scope: Scope
+  remoteId: string
+  expires: number
+  folders: FavoriteFolder[]
+  folderIds: string[]
+}
 
-/** Explicit, additive writes only. Never replay a write as an authentication probe or network retry. */
+/** Explicit user-requested writes only; never retry a write as an authentication probe. */
 export class FavoriteActions {
   private editors = new Map<string, Editor>()
   private writes = new Set<Promise<unknown>>()
@@ -57,6 +68,11 @@ export class FavoriteActions {
   async idle(stop = false): Promise<void> {
     if (stop) this.writeEpoch++
     await Promise.allSettled([...this.writes])
+  }
+  private async accountSnapshot(accountId: string): Promise<Account> {
+    const account = (await this.db.call('accounts', undefined)).find((entry) => entry.id === accountId)
+    if (!account) throw new AppError('AUTH_REQUIRED', '请先选择账号。')
+    return account
   }
   private async guard(scope: Scope, check: () => void): Promise<void> {
     check()
@@ -132,6 +148,7 @@ export class FavoriteActions {
   private async remoteFolderWorkIds(
     accountId: string,
     remoteFolderId: string,
+    expectedCount: number,
     check: () => void,
     platform: Platform = (action) => action()
   ): Promise<Set<string>> {
@@ -155,7 +172,13 @@ export class FavoriteActions {
       if (page.skipped.length)
         throw new AppError('INVALID_ITEMS', '云端收藏夹包含无法读取的作品，已停止写回以避免遗漏。')
       for (const work of page.items) workIds.add(work.id)
-      if (!page.hasMore) return workIds
+      if (!page.hasMore) {
+        if (workIds.size !== expectedCount)
+          console.warn(
+            `[writeback] cloud folder=${remoteFolderId} reports=${expectedCount} readable=${workIds.size}; proceeding with readable IDs`
+          )
+        return workIds
+      }
       cursor = page.cursor
     }
     throw new AppError('TOO_MANY_ITEMS', '收藏夹分页过多，已停止写回。')
@@ -164,6 +187,7 @@ export class FavoriteActions {
   private async remoteFolderWorks(
     accountId: string,
     remoteFolderId: string,
+    expectedCount: number,
     check: () => void
   ): Promise<{ works: Work[]; complete: boolean; skipped: number }> {
     const works = new Map<string, Work>()
@@ -193,7 +217,14 @@ export class FavoriteActions {
       console.info(
         `[diff] cloud page ${pageNumber + 1} folder=${remoteFolderId} items=${page.items.length} hasMore=${page.hasMore}`
       )
-      if (!page.hasMore) return { works: [...works.values()], complete, skipped }
+      if (!page.hasMore) {
+        const listed = [...works.values()]
+        return {
+          works: listed,
+          complete: complete && listed.length === expectedCount,
+          skipped
+        }
+      }
       cursor = page.cursor
     }
     throw new AppError('TOO_MANY_ITEMS', '收藏夹分页过多，已停止核对。')
@@ -230,13 +261,27 @@ export class FavoriteActions {
           remoteOnly: [],
           truncated: local.length > limit
         }
-      const remote = await this.remoteFolderWorks(accountId, folder.remoteId, check)
+      const account = await this.identity(accountId, check)
+      if (!account.remoteId) throw new AppError('AUTH_REQUIRED', '请先登录并核验抖音账号。')
+      const cloudFolders = await this.folders(accountId, check, account.remoteId)
+      const cloudFolder = cloudFolders.find((entry) => entry.remoteId === folder.remoteId)
+      if (!cloudFolder) throw new AppError('FOLDER_CHANGED', '云端收藏夹已变化，请重新核对。')
+      const expectedRemoteCount = cloudFolder.remoteCount
+      await this.db.call('favoriteFolderSetRemoteCount', {
+        accountId,
+        accountRemoteId: account.remoteId,
+        folderId,
+        folderRemoteId: folder.remoteId,
+        remoteCount: expectedRemoteCount
+      })
+      this.changed()
+      const remote = await this.remoteFolderWorks(accountId, folder.remoteId, expectedRemoteCount, check)
       const localIds = new Set(local.map((work) => work.id))
       const remoteIds = new Set(remote.works.map((work) => work.id))
       const add = local.filter((work) => !remoteIds.has(work.id))
       const remoteOnly = remote.works.filter((work) => !localIds.has(work.id))
       console.info(
-        `[diff] done folder=${folderId} add=${add.length} remoteOnly=${remoteOnly.length} complete=${remote.complete}`
+        `[diff] done folder=${folderId} add=${add.length} remoteOnly=${remoteOnly.length} remote=${remote.works.length}/${expectedRemoteCount} complete=${remote.complete}`
       )
       return {
         ...base,
@@ -244,22 +289,30 @@ export class FavoriteActions {
         complete: remote.complete,
         skipped: remote.skipped,
         remoteCount: remote.works.length,
+        expectedRemoteCount,
         add: add.slice(0, limit),
         remoteOnly: remoteOnly.slice(0, limit),
         truncated: add.length > limit || remoteOnly.length > limit
       }
     })
   }
-  async open(scope: Scope): Promise<FavoriteEditor> {
+  async open(scope: Scope, refreshFolders = false): Promise<FavoriteEditor> {
     return this.run(scope.accountId, async (check) => {
       await this.guard(scope, check)
-      const account = await this.identity(scope.accountId, check)
-      if (!account.remoteId) throw new AppError('AUTH_REQUIRED', '请先登录并核验账号。')
-      const state = parseFavoriteState(
-        await this.engine.request(scope.accountId, 'detail', { aweme_id: scope.workId }),
-        scope.workId
-      )
-      const folders = await this.folders(scope.accountId, check, account.remoteId ?? '')
+      const preferences = await this.db.call('appPreferences', {})
+      refreshFolders = refreshFolders && preferences.syncFavoritesToCloud
+      const account = refreshFolders
+        ? await this.identity(scope.accountId, check)
+        : await this.accountSnapshot(scope.accountId)
+      if (preferences.syncFavoritesToCloud && !account.remoteId)
+        throw new AppError('AUTH_REQUIRED', '请先登录并核验账号。')
+      const state = await this.db.call('favoriteStatus', {
+        accountId: scope.accountId,
+        workId: scope.workId
+      })
+      const folders = refreshFolders
+        ? await this.folders(scope.accountId, check, account.remoteId ?? undefined)
+        : await this.db.call('favoriteFolders', { accountId: scope.accountId })
       const folderIds = (
         await this.db.call('favoriteFolderMemberships', {
           accountId: scope.accountId,
@@ -267,15 +320,6 @@ export class FavoriteActions {
         })
       ).map((entry) => entry.folderId)
       await this.guard(scope, check)
-      // A read can confirm an existing remote collection without inventing folder memberships.
-      if (state.collected) {
-        await this.db.call('favoriteConfirm', {
-          accountId: scope.accountId,
-          remoteId: account.remoteId,
-          work: state.work
-        })
-        this.changed()
-      }
       for (const [token, editor] of this.editors) {
         if (editor.expires < Date.now() || editor.scope.accountId === scope.accountId)
           this.editors.delete(token)
@@ -283,9 +327,10 @@ export class FavoriteActions {
       const token = randomUUID()
       this.editors.set(token, {
         scope: { ...scope },
-        remoteId: account.remoteId,
+        remoteId: account.remoteId ?? '',
         expires: Date.now() + 10 * 60_000,
-        folders
+        folders,
+        folderIds
       })
       const overview = await this.db.call('libraryOverview', { accountId: scope.accountId })
       return {
@@ -318,7 +363,8 @@ export class FavoriteActions {
   save(
     accountId: string,
     token: string,
-    folderIds: string[]
+    folderIds: string[],
+    removeFolderIds: string[] = []
   ): Promise<{ collected: true; foldersAdded: number }> {
     const epoch = this.writeEpoch
     return this.write(token, () =>
@@ -330,34 +376,117 @@ export class FavoriteActions {
         }
         const editor = this.editor(accountId, token)
         await this.guard(editor.scope, valid)
-        const account = await this.identity(accountId, check)
-        if (account.remoteId !== editor.remoteId)
+        const preferences = await this.db.call('appPreferences', {})
+        const knownFolders = preferences.syncFavoritesToCloud
+          ? null
+          : await this.db.call('favoriteFolders', { accountId })
+        let needsCloudIdentity = preferences.syncFavoritesToCloud
+        if (!needsCloudIdentity && knownFolders) {
+          for (const id of removeFolderIds) {
+            const folder = knownFolders.find((entry) => entry.id === id)
+            if (!folder?.remoteId || folder.localOnly) continue
+            const unsynced = await this.db.call('favoriteFolderUnsyncedWorkIds', {
+              accountId,
+              folderId: folder.id
+            })
+            if (!unsynced.includes(editor.scope.workId)) {
+              needsCloudIdentity = true
+              break
+            }
+          }
+        }
+        const account = needsCloudIdentity
+          ? await this.identity(accountId, check)
+          : await this.accountSnapshot(accountId)
+        if (preferences.syncFavoritesToCloud && account.remoteId !== editor.remoteId)
           throw new AppError('IDENTITY_MISMATCH', '当前抖音身份已变化，未发送收藏请求。')
-        const state = parseFavoriteState(
-          await this.engine.request(accountId, 'detail', { aweme_id: editor.scope.workId }),
-          editor.scope.workId
-        )
-        const folders = await this.folders(accountId, valid, account.remoteId ?? '')
+        if (!preferences.syncFavoritesToCloud && editor.remoteId && account.remoteId !== editor.remoteId)
+          throw new AppError('IDENTITY_MISMATCH', '当前抖音身份已变化，未发送收藏请求。')
+        let state: { work: Work; collected: boolean; type?: string }
+        let stateSynced: boolean
+        let folders: FavoriteFolder[]
+        if (preferences.syncFavoritesToCloud) {
+          state = parseFavoriteState(
+            await this.engine.request(accountId, 'detail', { aweme_id: editor.scope.workId }),
+            editor.scope.workId
+          )
+          stateSynced = state.collected
+          folders = await this.folders(accountId, valid, account.remoteId ?? undefined)
+        } else {
+          const queue = await this.db.call('queueState', { accountId })
+          if (!queue || queue.queueId !== editor.scope.queueId || queue.work.id !== editor.scope.workId)
+            throw new AppError('QUEUE_CHANGED', '播放作品已变化，请为当前作品重新打开收藏。')
+          const localStatus = await this.db.call('favoriteStatus', {
+            accountId,
+            workId: editor.scope.workId
+          })
+          state = { work: queue.work, collected: localStatus.collected }
+          stateSynced = localStatus.synced
+          folders = knownFolders ?? (await this.db.call('favoriteFolders', { accountId }))
+        }
         const targets = [...new Set(folderIds)].map((id) => {
           const folder = folders.find((entry) => entry.id === id)
           if (!folder) throw new AppError('FOLDER_CHANGED', '所选收藏夹已变化，请重新读取后再保存。')
           return folder
         })
-        const preferences = await this.db.call('appPreferences', {})
+        const removals = [...new Set(removeFolderIds)].map((id) => {
+          if (!editor.folderIds.includes(id))
+            throw new AppError('INVALID_INPUT', '只能取消当前作品已加入的收藏夹。')
+          if (targets.some((folder) => folder.id === id))
+            throw new AppError('INVALID_INPUT', '同一收藏夹不能同时加入和移出。')
+          const folder = folders.find((entry) => entry.id === id)
+          if (!folder) throw new AppError('FOLDER_CHANGED', '要移出的收藏夹已变化，请重新读取后再保存。')
+          return folder
+        })
         let inflight = false,
           collected = state.collected,
-          foldersAdded = 0
+          foldersAdded = 0,
+          foldersRemoved = 0
+        const removeMemberships = async () => {
+          for (const folder of removals) {
+            const cloud = !folder.localOnly && !!folder.remoteId
+            const unsynced = cloud
+              ? new Set(
+                  await this.db.call('favoriteFolderUnsyncedWorkIds', {
+                    accountId,
+                    folderId: folder.id
+                  })
+                )
+              : new Set<string>()
+            if (cloud && !unsynced.has(state.work.id)) {
+              await this.guard(editor.scope, valid)
+              inflight = true
+              parseWriteResult(
+                await this.engine.request(accountId, 'favoriteFolderRemove', {
+                  aweme_id: state.work.id,
+                  item_ids: state.work.id,
+                  item_type: '2',
+                  from_collects_id: folder.remoteId!,
+                  collects_name: folder.title
+                })
+              )
+              inflight = false
+            }
+            await this.db.call('favoriteForgetFolderWork', {
+              accountId,
+              remoteId: editor.remoteId,
+              folderId: folder.id,
+              workId: state.work.id
+            })
+            foldersRemoved++
+            this.changed()
+          }
+        }
         try {
           await this.guard(editor.scope, valid)
           if (!preferences.syncFavoritesToCloud) {
-            // Cloud writeback is off: keep the collection local and let a later
-            // explicit writeback push it, without sending any platform write here.
+            // Cloud writeback is off: collection and additions stay local.
             await this.db.call('favoriteConfirm', {
               accountId,
               remoteId: editor.remoteId,
               work: state.work,
               favoriteAddIntent: true,
-              synced: state.collected
+              synced: stateSynced
             })
             this.changed()
             for (const folder of targets) {
@@ -371,10 +500,13 @@ export class FavoriteActions {
               foldersAdded++
               this.changed()
             }
+            await removeMemberships()
             this.editors.delete(token)
             return { collected: true, foldersAdded }
           }
           if (!collected) {
+            if (state.type === undefined)
+              throw new AppError('INVALID_RESPONSE', '无法确认作品类型，未发送收藏请求。')
             inflight = true
             parseWriteResult(
               await this.engine.request(accountId, 'favoriteAdd', {
@@ -431,6 +563,7 @@ export class FavoriteActions {
             foldersAdded++
             this.changed()
           }
+          await removeMemberships()
           this.editors.delete(token)
           return { collected: true, foldersAdded }
         } catch (error) {
@@ -439,6 +572,10 @@ export class FavoriteActions {
           throw new AppError(
             code,
             `${collected ? '作品已收藏，已确认的结果已同步到本地。' : ''}${
+              foldersAdded || foldersRemoved
+                ? `已确认加入 ${foldersAdded} 个收藏夹、移出 ${foldersRemoved} 个收藏夹。`
+                : ''
+            }${
               inflight && code !== 'API_REJECTED'
                 ? '部分操作结果未确认，未自动重发；请重新读取，并在抖音原页核对。'
                 : error instanceof AppError
@@ -455,14 +592,20 @@ export class FavoriteActions {
       this.run(accountId, async (check) => {
         const editor = this.editor(accountId, token)
         await this.guard(editor.scope, check)
-        const account = await this.identity(accountId, check)
-        if (account.remoteId !== editor.remoteId)
+        const preferences = await this.db.call('appPreferences', {})
+        const account = preferences.syncFavoritesToCloud
+          ? await this.identity(accountId, check)
+          : await this.accountSnapshot(accountId)
+        if (preferences.syncFavoritesToCloud && account.remoteId !== editor.remoteId)
           throw new AppError('IDENTITY_MISMATCH', '当前抖音身份已变化，收藏夹未创建。')
-        const existing = await this.folders(accountId, check, account.remoteId ?? '')
+        if (!preferences.syncFavoritesToCloud && editor.remoteId && account.remoteId !== editor.remoteId)
+          throw new AppError('IDENTITY_MISMATCH', '当前抖音身份已变化，收藏夹未创建。')
+        const existing = preferences.syncFavoritesToCloud
+          ? await this.folders(accountId, check, account.remoteId ?? undefined)
+          : await this.db.call('favoriteFolders', { accountId })
         if (existing.some((folder) => folder.title === name))
           throw new AppError('FOLDER_EXISTS', '已有同名收藏夹，请直接选择。')
         await this.guard(editor.scope, check)
-        const preferences = await this.db.call('appPreferences', {})
         if (!preferences.syncFavoritesToCloud) {
           // Writeback is off: the folder belongs to the local library only and
           // is created on the platform by a later explicit writeback.
@@ -525,20 +668,66 @@ export class FavoriteActions {
         throw new AppError('LOCAL_FOLDER_ONLY', '只有本地创建的收藏夹可以在本机改名。')
       if (folders.some((entry) => entry.id !== folderId && entry.title === title))
         throw new AppError('FOLDER_EXISTS', '已有同名收藏夹，请选择其他名称。')
-      // A locally managed folder that is already linked to a cloud collection keeps
-      // its cloud name in sync. The maintain endpoint renames with action=2.
+      // Keep the cloud visibility unchanged when renaming a linked folder.
       if (folder.remoteId && !folder.localOnly) {
         parseWriteResult(
           await this.engine.request(accountId, 'favoriteFolderCreate', {
-            action: '2',
+            action: '0',
             collects_id: folder.remoteId,
-            collects_name: title
+            collects_name: title,
+            secret: folderSecret(folder)
           })
         )
       }
       const updated = await this.db.call('favoriteLocalFolderEdit', { accountId, folderId, title })
       this.changed()
       return updated
+    })
+  }
+  async renameCloudFolder(accountId: string, folderId: string, title: string): Promise<FavoriteFolder> {
+    return this.run(accountId, async (check) => {
+      const account = await this.identity(accountId, check)
+      if (!account.remoteId) throw new AppError('AUTH_REQUIRED', '请先登录并核验账号。')
+      const folders = await this.db.call('favoriteFolders', { accountId })
+      const folder = folders.find((entry) => entry.id === folderId)
+      if (!folder?.remoteId || folder.localOnly || folder.managedLocally)
+        throw new AppError('FOLDER_CHANGED', '云端收藏夹已变化，请重新读取。')
+      if (folders.some((entry) => entry.id !== folderId && entry.title === title))
+        throw new AppError('FOLDER_EXISTS', '已有同名收藏夹，请选择其他名称。')
+      parseWriteResult(
+        await this.engine.request(accountId, 'favoriteFolderCreate', {
+          action: '0',
+          collects_id: folder.remoteId,
+          collects_name: title,
+          secret: folderSecret(folder)
+        })
+      )
+      const updated = await this.db.call('favoriteCloudFolderEdit', { accountId, folderId, title })
+      this.changed()
+      return updated
+    })
+  }
+  async deleteCloudFolder(
+    accountId: string,
+    folderId: string
+  ): Promise<{ folderId: string; title: string; localCount: number }> {
+    return this.run(accountId, async (check) => {
+      const account = await this.identity(accountId, check)
+      if (!account.remoteId) throw new AppError('AUTH_REQUIRED', '请先登录并核验账号。')
+      const folder = (await this.db.call('favoriteFolders', { accountId })).find(
+        (entry) => entry.id === folderId
+      )
+      if (!folder?.remoteId || folder.localOnly)
+        throw new AppError('FOLDER_CHANGED', '云端收藏夹已变化，请重新读取。')
+      parseWriteResult(
+        await this.engine.request(accountId, 'favoriteFolderCreate', {
+          action: '2',
+          collects_id: folder.remoteId
+        })
+      )
+      const result = await this.db.call('favoriteCloudFolderDelete', { accountId, folderId })
+      this.changed()
+      return result
     })
   }
   async removeFromFolder(
@@ -715,6 +904,252 @@ export class FavoriteActions {
       }
     })
   }
+  async updateFolderMemberships(
+    accountId: string,
+    fromFolderId: string,
+    addFolderIds: string[],
+    removeFolderIds: string[],
+    workIds: string[]
+  ): Promise<{
+    fromFolderTitle: string
+    addedFolderTitles: string[]
+    removedFolderTitles: string[]
+    updated: number
+    cloudSync: boolean
+  }> {
+    return this.run(accountId, async (check) => {
+      const account = await this.identity(accountId, check)
+      if (!account.remoteId) throw new AppError('AUTH_REQUIRED', '请先登录并核验账号。')
+      if (addFolderIds.includes(fromFolderId) || removeFolderIds.includes(fromFolderId))
+        throw new AppError('INVALID_INPUT', '原收藏夹不能同时作为目标收藏夹。')
+      if (addFolderIds.some((id) => removeFolderIds.includes(id)))
+        throw new AppError('INVALID_INPUT', '同一收藏夹不能同时加入和移出。')
+
+      const folders = await this.db.call('favoriteFolders', { accountId })
+      const from = folders.find((folder) => folder.id === fromFolderId)
+      if (!from) throw new AppError('FOLDER_CHANGED', '原收藏夹已不存在，请重新读取。')
+      const additions = [...new Set(addFolderIds)].map((id) => {
+        const folder = folders.find((entry) => entry.id === id)
+        if (!folder) throw new AppError('FOLDER_CHANGED', '目标收藏夹已不存在，请重新读取。')
+        return folder
+      })
+      const removals = [...new Set(removeFolderIds)].map((id) => {
+        const folder = folders.find((entry) => entry.id === id)
+        if (!folder) throw new AppError('FOLDER_CHANGED', '要移出的收藏夹已不存在，请重新读取。')
+        return folder
+      })
+      const targets = [...new Set(workIds)]
+      const works = await this.db.call('worksByIds', { workIds: targets })
+      const byId = new Map(works.map((entry) => [entry.id, entry]))
+      if (targets.some((id) => !byId.has(id)))
+        throw new AppError('WORK_UNAVAILABLE', '部分作品已不在本地列表中，请刷新后重试。')
+
+      const preferences = await this.db.call('appPreferences', {})
+      const cloudSync = !!preferences.syncFavoritesToCloud
+      const remoteFromId = from.remoteId ?? (from.localOnly ? null : from.id)
+      const remoteAddIds = additions.map((folder) =>
+        cloudSync ? (folder.remoteId ?? (folder.localOnly ? null : folder.id)) : null
+      )
+      const remoteRemoveIds = removals.map((folder) =>
+        cloudSync ? (folder.remoteId ?? (folder.localOnly ? null : folder.id)) : null
+      )
+      const existingMemberships = await Promise.all(
+        [from, ...removals].map(async (folder) => ({
+          folderId: folder.id,
+          workIds: new Set(await this.db.call('favoriteFolderWorkIds', { accountId, folderId: folder.id })),
+          unsynced: new Set(
+            await this.db.call('favoriteFolderUnsyncedWorkIds', { accountId, folderId: folder.id })
+          )
+        }))
+      )
+      const membershipByFolder = new Map(existingMemberships.map((entry) => [entry.folderId, entry]))
+      const remoteAdditions = additions.map((folder, index) => ({
+        folder,
+        remoteId: remoteAddIds[index]
+      }))
+      let updated = 0,
+        added = 0,
+        removed = 0
+      try {
+        for (const workId of targets) {
+          check()
+          const work = byId.get(workId)!
+          for (const { folder, remoteId } of remoteAdditions) {
+            if (remoteId) {
+              parseWriteResult(
+                await this.engine.request(accountId, 'favoriteFolderAdd', {
+                  aweme_id: work.id,
+                  item_ids: work.id,
+                  item_type: '2',
+                  to_collects_id: remoteId,
+                  collects_name: folder.title,
+                  update_collects_sort: 'true'
+                })
+              )
+            }
+            await this.db.call('favoriteConfirm', {
+              accountId,
+              remoteId: account.remoteId,
+              work,
+              folder: remoteId ? { ...folder, remoteCount: folder.remoteCount + 1 } : folder,
+              queueWrite: cloudSync && !remoteId,
+              synced: !!remoteId
+            })
+            added++
+            this.changed()
+          }
+
+          for (const [index, folder] of removals.entries()) {
+            const membership = membershipByFolder.get(folder.id)!
+            if (!membership.workIds.has(work.id)) continue
+            const remoteId = remoteRemoveIds[index]
+            if (remoteId && !membership.unsynced.has(work.id)) {
+              parseWriteResult(
+                await this.engine.request(accountId, 'favoriteFolderRemove', {
+                  aweme_id: work.id,
+                  item_ids: work.id,
+                  item_type: '2',
+                  from_collects_id: remoteId,
+                  collects_name: folder.title
+                })
+              )
+            }
+            await this.db.call('favoriteForgetFolderWork', {
+              accountId,
+              remoteId: account.remoteId,
+              folderId: folder.id,
+              workId: work.id,
+              synced: cloudSync
+            })
+            removed++
+            this.changed()
+          }
+
+          const sourceMembership = membershipByFolder.get(from.id)!
+          if (sourceMembership.workIds.has(work.id)) {
+            if (cloudSync && remoteFromId && !sourceMembership.unsynced.has(work.id)) {
+              parseWriteResult(
+                await this.engine.request(accountId, 'favoriteFolderRemove', {
+                  aweme_id: work.id,
+                  item_ids: work.id,
+                  item_type: '2',
+                  from_collects_id: remoteFromId,
+                  collects_name: from.title
+                })
+              )
+            }
+            await this.db.call('favoriteForgetFolderWork', {
+              accountId,
+              remoteId: account.remoteId,
+              folderId: from.id,
+              workId: work.id,
+              synced: cloudSync
+            })
+            removed++
+            this.changed()
+          }
+          updated++
+        }
+      } catch (error) {
+        this.changed()
+        const code = error instanceof AppError ? error.code : 'WRITE_UNCONFIRMED'
+        const message = error instanceof Error ? error.message : '更新收藏夹失败。'
+        throw new AppError(
+          code,
+          `${updated ? `已更新 ${updated} 条作品；` : ''}${
+            added || removed ? `已确认加入 ${added} 项、移出 ${removed} 项；` : ''
+          }${message}`
+        )
+      }
+      this.changed()
+      return {
+        fromFolderTitle: from.title,
+        addedFolderTitles: additions.map((folder) => folder.title),
+        removedFolderTitles: [...removals.map((folder) => folder.title), from.title],
+        updated,
+        cloudSync
+      }
+    })
+  }
+  async addToFolders(
+    accountId: string,
+    addFolderIds: string[],
+    workIds: string[]
+  ): Promise<{ added: number; folderTitles: string[]; cloudSync: boolean }> {
+    return this.run(accountId, async (check) => {
+      const account = await this.identity(accountId, check)
+      if (!account.remoteId) throw new AppError('AUTH_REQUIRED', '请先登录并核验账号。')
+      const folders = await this.db.call('favoriteFolders', { accountId })
+      const additions = [...new Set(addFolderIds)].map((id) => {
+        const folder = folders.find((entry) => entry.id === id)
+        if (!folder) throw new AppError('FOLDER_CHANGED', '目标收藏夹已不存在，请重新读取。')
+        return folder
+      })
+      const targets = [...new Set(workIds)]
+      const works = await this.db.call('worksByIds', { workIds: targets })
+      const byId = new Map(works.map((entry) => [entry.id, entry]))
+      if (targets.some((id) => !byId.has(id)))
+        throw new AppError('WORK_UNAVAILABLE', '部分作品已不在本地列表中，请刷新后重试。')
+
+      const preferences = await this.db.call('appPreferences', {})
+      const cloudSync = !!preferences.syncFavoritesToCloud
+      const memberships = await Promise.all(
+        additions.map(async (folder) => ({
+          folder,
+          workIds: new Set(await this.db.call('favoriteFolderWorkIds', { accountId, folderId: folder.id })),
+          remoteId: cloudSync ? (folder.remoteId ?? (folder.localOnly ? null : folder.id)) : null,
+          remoteCount: folder.remoteCount
+        }))
+      )
+      let updated = 0,
+        added = 0
+      try {
+        for (const workId of targets) {
+          check()
+          const work = byId.get(workId)!
+          let changed = false
+          for (const membership of memberships) {
+            if (membership.workIds.has(work.id)) continue
+            if (membership.remoteId) {
+              parseWriteResult(
+                await this.engine.request(accountId, 'favoriteFolderAdd', {
+                  aweme_id: work.id,
+                  item_ids: work.id,
+                  item_type: '2',
+                  to_collects_id: membership.remoteId,
+                  collects_name: membership.folder.title,
+                  update_collects_sort: 'true'
+                })
+              )
+            }
+            await this.db.call('favoriteConfirm', {
+              accountId,
+              remoteId: account.remoteId,
+              work,
+              folder: membership.remoteId
+                ? { ...membership.folder, remoteCount: membership.remoteCount + 1 }
+                : membership.folder,
+              queueWrite: cloudSync && !membership.remoteId,
+              synced: !!membership.remoteId
+            })
+            if (membership.remoteId) membership.remoteCount++
+            membership.workIds.add(work.id)
+            added++
+            changed = true
+            this.changed()
+          }
+          if (changed) updated++
+        }
+      } catch (error) {
+        this.changed()
+        const code = error instanceof AppError ? error.code : 'WRITE_UNCONFIRMED'
+        const message = error instanceof Error ? error.message : '添加到收藏夹失败。'
+        throw new AppError(code, `${added ? `已添加 ${added} 项；` : ''}${message}`)
+      }
+      this.changed()
+      return { added, folderTitles: additions.map((folder) => folder.title), cloudSync }
+    })
+  }
   async syncToCloud(
     accountId: string,
     check: () => void,
@@ -725,6 +1160,13 @@ export class FavoriteActions {
     remaining: number
     scopeRemaining: number
     skipped: number
+    completedItems: {
+      kind: string
+      folderId: string | null
+      workId: string | null
+      title: string | null
+      outcome: string
+    }[]
     skippedItems: { workId: string; kind: string; reason: string }[]
     truncated: boolean
   }> {
@@ -754,17 +1196,34 @@ export class FavoriteActions {
       this.syncPlan = { accountId, scope: scopeKey, scanned: new Set(), refreshedAt: started }
     else this.syncPlan.refreshedAt = started
     const plan = this.syncPlan
-    for (const folder of folders.filter((entry) => folderIds.includes(entry.id) && !entry.localOnly)) {
+    const foldersToScan = folders.filter(
+      (entry) => folderIds.includes(entry.id) && !entry.localOnly && !plan.scanned.has(entry.id)
+    )
+    const cloudFolders = foldersToScan.length
+      ? await this.folders(accountId, check, account.remoteId, request)
+      : []
+    const remoteWorkIdsByFolder = new Map<string, Set<string>>()
+    for (const folder of foldersToScan) {
       // The first batch of a scope reconciles the whole cloud folder. Later
       // batches reuse that result instead of re-reading every page: locally
       // added members are already staged by favoriteStageLocalFolders, and the
       // per-item detail check still covers the default favorite state.
-      if (plan.scanned.has(folder.id)) continue
       const remoteFolderId = folder.remoteId ?? folder.id
+      const cloudFolder = cloudFolders.find((entry) => entry.remoteId === remoteFolderId)
+      if (!cloudFolder) throw new AppError('FOLDER_CHANGED', '云端收藏夹已变化，请重新选择写回范围。')
+      await this.db.call('favoriteFolderSetRemoteCount', {
+        accountId,
+        accountRemoteId: account.remoteId,
+        folderId: folder.id,
+        folderRemoteId: remoteFolderId,
+        remoteCount: cloudFolder.remoteCount
+      })
+      this.changed()
       const [localWorkIds, remoteWorkIds] = await Promise.all([
         this.db.call('favoriteFolderWorkIds', { accountId, folderId: folder.id }),
-        this.remoteFolderWorkIds(accountId, remoteFolderId, check, request)
+        this.remoteFolderWorkIds(accountId, remoteFolderId, cloudFolder.remoteCount, check, request)
       ])
+      remoteWorkIdsByFolder.set(folder.id, remoteWorkIds)
       for (const workId of localWorkIds) {
         if (remoteWorkIds.has(workId)) continue
         await this.db.call('favoriteQueueWrite', {
@@ -797,13 +1256,23 @@ export class FavoriteActions {
         .map((operation) => operation.workId)
         .filter((workId): workId is string => !!workId)
     )
+    const alreadyRemoteFolderAdds = staged.filter(
+      (operation) =>
+        operation.kind === 'folder-add' &&
+        selected.has(operation.folderId ?? '') &&
+        !!operation.workId &&
+        remoteWorkIdsByFolder.get(operation.folderId ?? '')?.has(operation.workId)
+    )
+    for (const operation of alreadyRemoteFolderAdds)
+      await this.db.call('favoriteWriteComplete', { accountId, operationId: operation.id })
+    const alreadyRemoteFolderAddIds = new Set(alreadyRemoteFolderAdds.map((operation) => operation.id))
     const operations = staged.filter((operation) =>
       operation.kind === 'favorite-add'
         ? includeDefault || selectedFolderWorks.has(operation.workId ?? '')
-        : selected.has(operation.folderId ?? '')
+        : selected.has(operation.folderId ?? '') && !alreadyRemoteFolderAddIds.has(operation.id)
     )
     const batch = operations.slice(0, WRITEBACK_BATCH_LIMIT)
-    let synced = 0
+    let synced = alreadyRemoteFolderAdds.length
     let skipped = 0
     let processed = 0
     const report = () =>
@@ -815,6 +1284,20 @@ export class FavoriteActions {
       })
     report()
     const skippedWorkIds = new Set<string>()
+    const completedItems: {
+      kind: string
+      folderId: string | null
+      workId: string | null
+      title: string | null
+      outcome: string
+    }[] = alreadyRemoteFolderAdds.map((operation) => ({
+      kind: operation.kind,
+      folderId: operation.folderId,
+      workId: operation.workId,
+      title: operation.title,
+      outcome: 'already-in-folder'
+    }))
+    const folderAddsToVerify: (typeof batch)[number][] = []
     const skippedItems: { workId: string; kind: string; reason: string }[] = []
     for (const operation of batch) {
       check()
@@ -825,6 +1308,7 @@ export class FavoriteActions {
         continue
       }
       try {
+        let outcome = 'request-accepted'
         if (operation.kind === 'favorite-add') {
           const state = parseFavoriteState(
             await request(() => this.engine.request(accountId, 'detail', { aweme_id: operation.workId! })),
@@ -840,12 +1324,15 @@ export class FavoriteActions {
                 })
               )
             )
+          else outcome = 'already-collected'
         } else if (operation.kind === 'folder-create') {
           const folders = await this.folders(accountId, check, account.remoteId ?? '', request)
           const existing = folders.find((folder) => !folder.localOnly && folder.title === operation.title)
           let remoteFolder: FavoriteFolder
-          if (existing) remoteFolder = existing
-          else {
+          if (existing) {
+            remoteFolder = existing
+            outcome = 'already-existed'
+          } else {
             const response = await request(() =>
               this.engine.request(accountId, 'favoriteFolderCreate', {
                 action: '1',
@@ -915,8 +1402,8 @@ export class FavoriteActions {
             })
           }
         }
-        await this.db.call('favoriteWriteComplete', { accountId, operationId: operation.id })
         if (operation.kind === 'folder-add' && operation.folderId) {
+          folderAddsToVerify.push(operation)
           const folder = (await this.db.call('favoriteFolders', { accountId })).find(
             (entry) => entry.id === operation.folderId
           )
@@ -924,10 +1411,19 @@ export class FavoriteActions {
             await this.db.call('favoriteRememberFolder', {
               accountId,
               remoteId: account.remoteId,
-              folder: { ...folder, remoteCount: folder.remoteCount + 1 }
+              folder
             })
+        } else {
+          await this.db.call('favoriteWriteComplete', { accountId, operationId: operation.id })
+          completedItems.push({
+            kind: operation.kind,
+            folderId: operation.folderId,
+            workId: operation.workId,
+            title: operation.title,
+            outcome
+          })
+          synced++
         }
-        synced++
         processed++
         report()
         // Space out platform writes; a tight burst trips the same risk control
@@ -953,9 +1449,75 @@ export class FavoriteActions {
         }
         const remaining = await this.db.call('favoriteWritePending', { accountId })
         const message = error instanceof Error ? error.message : '云端写回失败。'
+        const target = [
+          `kind=${operation.kind}`,
+          operation.folderId ? `folderId=${operation.folderId}` : '',
+          operation.workId ? `workId=${operation.workId}` : ''
+        ]
+          .filter(Boolean)
+          .join(' ')
+        this.syncPlan = null
         throw new AppError(
           error instanceof AppError ? error.code : 'WRITE_UNCONFIRMED',
-          `${synced ? `已完成 ${synced} 项；` : ''}写回“${operation.kind}”失败：${message}队列中仍有 ${remaining} 项，未自动重试。`
+          `${synced ? `已完成 ${synced} 项；` : ''}写回失败（${target}）：${message}队列中仍有 ${remaining} 项，未自动重试。`
+        )
+      }
+    }
+    if (folderAddsToVerify.length) {
+      const currentCloudFolders = await this.folders(accountId, check, account.remoteId, request)
+      const currentLocalFolders = await this.db.call('favoriteFolders', { accountId })
+      const unconfirmed: (typeof batch)[number][] = []
+      for (const folderId of new Set(
+        folderAddsToVerify.map((operation) => operation.folderId).filter((id): id is string => !!id)
+      )) {
+        const folder = currentLocalFolders.find((entry) => entry.id === folderId)
+        const remoteFolderId = folder?.remoteId ?? folderId
+        const cloudFolder = currentCloudFolders.find((entry) => entry.remoteId === remoteFolderId)
+        if (!folder || !cloudFolder)
+          throw new AppError('FOLDER_CHANGED', '写回后无法核实目标云端收藏夹，待写回操作已保留。')
+        await this.db.call('favoriteFolderSetRemoteCount', {
+          accountId,
+          accountRemoteId: account.remoteId,
+          folderId,
+          folderRemoteId: remoteFolderId,
+          remoteCount: cloudFolder.remoteCount
+        })
+        const remoteWorkIds = await this.remoteFolderWorkIds(
+          accountId,
+          remoteFolderId,
+          cloudFolder.remoteCount,
+          check,
+          request
+        )
+        for (const operation of folderAddsToVerify.filter((entry) => entry.folderId === folderId)) {
+          if (!operation.workId) continue
+          if (!remoteWorkIds.has(operation.workId)) {
+            unconfirmed.push(operation)
+            continue
+          }
+          await this.db.call('favoriteWriteComplete', { accountId, operationId: operation.id })
+          completedItems.push({
+            kind: operation.kind,
+            folderId: operation.folderId,
+            workId: operation.workId,
+            title: operation.title,
+            outcome: 'visible-after-refresh'
+          })
+          synced++
+        }
+      }
+      if (unconfirmed.length) {
+        this.syncPlan = null
+        const first = unconfirmed[0]!
+        const diagnostic = unconfirmed
+          .map((operation) => `${operation.folderId ?? ''}:${operation.workId ?? ''}`)
+          .join(',')
+        throw new AppError(
+          'WRITE_UNCONFIRMED',
+          `云端接口接受了写回请求，但刷新后仍有 ${unconfirmed.length} 个作品未出现在收藏夹列表；队列已保留。folderId=${first.folderId ?? ''} workId=${first.workId ?? ''}`,
+          undefined,
+          undefined,
+          `未确认项目 folderId:workId=${diagnostic}`
         )
       }
     }
@@ -969,6 +1531,7 @@ export class FavoriteActions {
       remaining,
       scopeRemaining: operations.length - batch.length,
       skipped,
+      completedItems,
       skippedItems,
       truncated: operations.length > batch.length
     }

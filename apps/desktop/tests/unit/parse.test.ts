@@ -154,6 +154,16 @@ describe('platform responses', () => {
       }).caption
     ).toBe('第一段\n\n第二段')
   })
+  it('parses platform video duration in milliseconds and safely defaults invalid values', () => {
+    expect(parseWork({ aweme_id: '123', duration: 60_000 }).durationMs).toBe(60_000)
+    expect(parseWork({ aweme_id: '124', duration: '90000' }).durationMs).toBe(90_000)
+    expect(parseWork({ aweme_id: '125', duration: 'unknown' }).durationMs).toBe(0)
+    expect(parseWork({ aweme_id: '126', video: { duration: 30_000 } }).durationMs).toBe(30_000)
+    expect(parseWork({ aweme_id: '127', duration: 0, video: { duration: 45_000 } }).durationMs).toBe(45_000)
+    expect(parseWork({ aweme_id: '128', duration: 'unknown', video: { duration: 50_000 } }).durationMs).toBe(
+      50_000
+    )
+  })
   it('extracts a valid author sec_uid for profile navigation', () => {
     expect(
       parseWork({
@@ -165,6 +175,20 @@ describe('platform responses', () => {
       author: '作者',
       authorId: null
     })
+  })
+  it('derives and validates author profile links', () => {
+    expect(parseWork({ aweme_id: '123', author: { sec_uid: 'MS4wLjABAAAA_example-123' } }).authorUrl).toBe(
+      'https://www.douyin.com/user/MS4wLjABAAAA_example-123'
+    )
+    expect(
+      parseWork({
+        aweme_id: '124',
+        author: { profile_url: 'https://www.douyin.com/user/external-link' }
+      }).authorUrl
+    ).toBe('https://www.douyin.com/user/external-link')
+    expect(
+      parseWork({ aweme_id: '125', author: { profile_url: 'https://example.com/user/nope' } }).authorUrl
+    ).toBe(null)
   })
   it('classifies collection items with article metadata as text works', () => {
     expect(
@@ -179,6 +203,27 @@ describe('platform responses', () => {
         max_cursor: '0'
       }).items[0]?.mediaType
     ).toBe('text')
+  })
+  it('classifies article works by aweme_type and preserves the raw type', () => {
+    expect(parseWork({ aweme_id: '1', aweme_type: 163, desc: '短摘要 #tag' })).toMatchObject({
+      mediaType: 'text',
+      awemeType: 163
+    })
+    expect(
+      parseWork({
+        aweme_id: '2',
+        aweme_type: '68',
+        images: [{ url_list: ['https://p3.douyinpic.com/a.jpg'] }]
+      })
+    ).toMatchObject({ mediaType: 'gallery', awemeType: 68 })
+    expect(
+      parseWork({
+        aweme_id: '3',
+        aweme_type: '55',
+        video: { cover: { url_list: ['https://p3.douyinpic.com/b.jpg'] } }
+      })
+    ).toMatchObject({ mediaType: 'video', awemeType: 55 })
+    expect(parseWork({ aweme_id: '4' }).awemeType).toBeNull()
   })
   it('rejects a success-looking HTTP response with an API error or missing paging evidence', () => {
     expect(() => parseResponse('{"status_code":8}', 200)).toThrow()
@@ -220,6 +265,20 @@ describe('platform responses', () => {
     ])
       expect(safeMediaUrl(value)).toBeNull()
   })
+  it('uses alternate video cover fields when the standard cover is absent', () => {
+    expect(
+      parseWork({
+        aweme_id: '123',
+        video: { dynamic_cover: { url_list: ['https://a.douyinpic.com/dynamic.jpg'] } }
+      }).coverUrl
+    ).toBe('https://a.douyinpic.com/dynamic.jpg')
+    expect(
+      parseWork({
+        aweme_id: '124',
+        video: { ai_dynamic_cover: { url_list: ['https://a.douyinpic.com/ai.jpg'] } }
+      }).coverUrl
+    ).toBe('https://a.douyinpic.com/ai.jpg')
+  })
   it('keeps static/live image positions aligned and prioritizes explicit H.264', () => {
     const media = parseMedia({
       aweme_detail: {
@@ -239,6 +298,23 @@ describe('platform responses', () => {
     })
     expect(media.images.map((i) => i.liveUrl)).toEqual([null, 'https://a.douyinvod.com/live'])
     expect(media.videos[0]).toBe('https://a.douyinvod.com/h264')
+  })
+  it('extracts gallery covers from alternate image URL fields', () => {
+    const detail = {
+      aweme_id: '123',
+      images: [
+        { display_image: { url_list: ['https://a.douyinpic.com/display.jpg'] } },
+        { origin_image: { url_list: ['https://a.douyinpic.com/origin.jpg'] } }
+      ]
+    }
+    expect(parseWork(detail)).toMatchObject({
+      coverUrl: 'https://a.douyinpic.com/display.jpg',
+      mediaType: 'gallery'
+    })
+    expect(parseMedia({ aweme_detail: detail }).images.map((image) => image.url)).toEqual([
+      'https://a.douyinpic.com/display.jpg',
+      'https://a.douyinpic.com/origin.jpg'
+    ])
   })
 })
 

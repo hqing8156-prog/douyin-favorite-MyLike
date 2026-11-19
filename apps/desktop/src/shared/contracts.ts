@@ -18,6 +18,7 @@ export const filterSchema = z.object({
   accountId: idSchema,
   search: z.string().max(200).default(''),
   mediaType: z.enum(['all', 'video', 'gallery', 'text']).default('all'),
+  durationGreaterThanMs: z.number().int().min(0).max(86_400_000).nullable().optional(),
   year: z.number().int().min(2000).max(2200).nullable().default(null),
   month: z.number().int().min(1).max(12).nullable().default(null),
   sort: z.enum(['published', 'collected']).default('published'),
@@ -62,7 +63,7 @@ export const commands = {
   collectionAction: z.object({
     accountId: idSchema,
     source: z.enum(['likes', 'favorites']),
-    action: z.enum(['top', 'down', 'stop', 'folders'])
+    action: z.enum(['top', 'down', 'stop', 'folders', 'rescan'])
   }),
   createAccount: z.object({ name: z.string().trim().min(1).max(40) }),
   switchAccount: z.object({ accountId: idSchema }),
@@ -111,6 +112,35 @@ export const commands = {
       workIds: z.array(workIdSchema).min(1).max(MAX_BATCH_SIZE)
     })
     .refine((input) => input.fromFolderId !== input.toFolderId),
+  favoriteFolderUpdateWorks: z
+    .object({
+      accountId: idSchema,
+      fromFolderId: folderIdSchema,
+      addFolderIds: z
+        .array(folderIdSchema)
+        .max(100)
+        .refine((ids) => new Set(ids).size === ids.length),
+      removeFolderIds: z
+        .array(folderIdSchema)
+        .max(100)
+        .refine((ids) => new Set(ids).size === ids.length),
+      workIds: z.array(workIdSchema).min(1).max(MAX_BATCH_SIZE)
+    })
+    .refine(
+      (input) =>
+        !input.addFolderIds.includes(input.fromFolderId) &&
+        !input.removeFolderIds.includes(input.fromFolderId) &&
+        input.addFolderIds.every((id) => !input.removeFolderIds.includes(id))
+    ),
+  favoriteFolderAddWorks: z.object({
+    accountId: idSchema,
+    addFolderIds: z
+      .array(folderIdSchema)
+      .min(1)
+      .max(100)
+      .refine((ids) => new Set(ids).size === ids.length),
+    workIds: z.array(workIdSchema).min(1).max(MAX_BATCH_SIZE)
+  }),
   favoriteFolderCreateLocal: z.object({
     accountId: idSchema,
     title: z.string().trim().min(1).max(30),
@@ -125,15 +155,32 @@ export const commands = {
     accountId: idSchema,
     folderId: z.string().min(1).max(100)
   }),
+  favoriteFolderRenameCloud: z.object({
+    accountId: idSchema,
+    folderId: folderIdSchema,
+    title: z.string().trim().min(1).max(30)
+  }),
+  favoriteFolderDeleteCloud: z.object({
+    accountId: idSchema,
+    folderId: folderIdSchema
+  }),
   favoriteStatus: z.object({ accountId: idSchema, workId: workIdSchema }),
-  favoriteEditor: playbackScopeSchema.extend({ workId: workIdSchema }),
+  favoriteEditor: playbackScopeSchema.extend({
+    workId: workIdSchema,
+    refresh: z.boolean().optional()
+  }),
   favoriteSave: z.object({
     accountId: idSchema,
     token: idSchema,
     folderIds: z
       .array(folderIdSchema)
       .max(100)
+      .refine((ids) => new Set(ids).size === ids.length),
+    removeFolderIds: z
+      .array(folderIdSchema)
+      .max(100)
       .refine((ids) => new Set(ids).size === ids.length)
+      .default([])
   }),
   favoriteCreateFolder: z.object({
     accountId: idSchema,
@@ -152,10 +199,7 @@ export const commands = {
       aiFolderNames: z.array(z.string().trim().min(1).max(30)).max(30),
       onlyUnclassified: z.boolean().default(false)
     })
-    .extend({ source: z.enum(['likes', 'favorites']).optional() })
-    .refine(
-      (input) => input.folderIds.length > 0 || (input.createAiFolders && input.aiFolderNames.length > 0)
-    ),
+    .extend({ source: z.enum(['likes', 'favorites']).optional() }),
   aiSuggestFolders: z.object({
     accountId: idSchema,
     source: z.enum(['likes', 'favorites']).optional()
@@ -171,7 +215,13 @@ export const commands = {
     text: z.string().min(1).max(4_000_000),
     createMissingFolders: z.boolean().default(true)
   }),
-  scanTextWorks: z.object({ accountId: idSchema, source: z.enum(['likes', 'favorites']) }),
+  fetchMissingCovers: z.object({ accountId: idSchema }),
+  stopMissingCovers: z.object({ accountId: idSchema }),
+  syncVideoDurations: z.object({ accountId: idSchema }),
+  stopVideoDurationSync: z.object({ accountId: idSchema }),
+  syncMissingAuthorIds: z.object({ accountId: idSchema }),
+  stopMissingAuthorIds: z.object({ accountId: idSchema }),
+  resetMissingAuthorIds: z.object({ accountId: idSchema }),
   aiTestConnection: z.object({ provider: z.enum(['deepseek', 'siliconflow']) }),
   collectionControl: z.object({
     accountId: idSchema,
@@ -229,12 +279,28 @@ export const commands = {
   appPreferences: z.object({ preferences: appPreferencesPatchSchema }),
   checkDatabase: z.object({}),
   copyText: z.object({ text: z.string().max(1024) }),
-  openAuthorProfile: z.object({ authorId: z.string().regex(/^[A-Za-z0-9_-]{8,200}$/) }),
+  openAuthorProfile: z
+    .object({
+      accountId: idSchema,
+      authorId: z
+        .string()
+        .regex(/^[A-Za-z0-9_-]{8,200}$/)
+        .optional(),
+      authorUrl: z
+        .string()
+        .max(2048)
+        .regex(/^https:\/\/[^\s]+$/)
+        .optional()
+    })
+    .refine((value) => !!value.authorId || !!value.authorUrl, {
+      message: '需要作者 ID 或作者主页链接。'
+    }),
   copyDiagnostics: z.object({}),
   openReleases: z.object({}),
   backup: z.object({}),
   dataInfo: z.object({ accountId: idSchema.nullable() }),
   openDataFolder: z.object({ target: z.enum(['data', 'backups', 'logs']) }),
+  openLogFile: z.object({ name: z.enum(['cover-refresh', 'duration-refresh']) }),
   pickCoverCacheDirectory: z.object({}),
   clearCache: z.object({ accountId: idSchema }),
   media: z.object({
@@ -283,10 +349,14 @@ export interface Work {
   title: string
   author: string
   authorId?: string | null
+  authorUrl?: string | null
   publishedAt: number
   coverUrl: string | null
   mediaType: 'video' | 'gallery' | 'text'
   isLive: boolean
+  durationMs?: number
+  /** Douyin work type. 163 is an article/text work; 68 is an image gallery. */
+  awemeType?: number | null
 }
 export interface Media {
   work: Work
@@ -328,6 +398,14 @@ export interface LibraryOverview {
   overlap: number
   folders: number
   years: { year: number | null; count: number }[]
+  authors: {
+    authorId: string
+    name: string
+    videos: number
+    galleries: number
+    texts: number
+    total: number
+  }[]
 }
 export type EngineStatus = 'stopped' | 'starting' | 'ready' | 'visible' | 'failed'
 export interface CollectionTask {
@@ -415,17 +493,73 @@ export interface FavoriteSyncProgress {
   /** 1-based batch number of the current run. */
   batch: number
 }
+export interface CoverRefreshProgress {
+  accountId: string
+  current: number
+  total: number
+  updated: number
+  failed: number
+  status: 'running' | 'paused'
+  pauseReason: 'verification' | 'limited' | 'manual' | 'interrupted' | null
+}
+export interface DataMaintenanceFailureReason {
+  reason: string
+  count: number
+}
+export interface DurationRefreshProgress {
+  accountId: string
+  current: number
+  total: number
+  updated: number
+  failed: number
+  status: 'running' | 'paused'
+  pauseReason: 'verification' | 'limited' | 'manual' | 'interrupted' | null
+  stopping: boolean
+}
+export interface DurationRefreshCheckpoint {
+  accountId: string
+  workIds: string[]
+  nextIndex: number
+  updated: number
+  failed: number
+  lastRequestAt: number
+  pauseReason: 'verification' | 'limited' | 'manual' | null
+}
+export interface AuthorIdRefreshProgress {
+  accountId: string
+  current: number
+  total: number
+  updated: number
+  failed: number
+  status: 'running' | 'paused'
+  pauseReason: 'verification' | 'limited' | 'manual' | 'interrupted' | null
+  stopping: boolean
+}
+export interface AuthorIdRefreshCheckpoint {
+  accountId: string
+  workIds: string[]
+  nextIndex: number
+  updated: number
+  failed: number
+  lastRequestAt: number
+  pauseReason: 'verification' | 'limited' | 'manual' | null
+}
+export interface CoverRefreshCheckpoint {
+  accountId: string
+  workIds: string[]
+  nextIndex: number
+  updated: number
+  failed: number
+  lastRequestAt: number
+  pauseReason: 'verification' | 'limited' | 'manual' | null
+}
 export interface Snapshot {
   aiClassification: AiClassificationProgress | null
   /** AI assignments saved but not yet applied locally, per source. */
   aiPendingAssignments: { likes: number; favorites: number }
-  textScan: {
-    accountId: string
-    source: 'likes' | 'favorites'
-    current: number
-    total: number
-    startedAt: number
-  } | null
+  coverRefresh: CoverRefreshProgress | null
+  durationRefresh: DurationRefreshProgress | null
+  authorIdRefresh: AuthorIdRefreshProgress | null
   favoriteWritePending: number
   favoriteSync: FavoriteSyncProgress | null
   favoriteSyncLast: FavoriteSyncLast | null
@@ -506,12 +640,14 @@ export interface FavoriteFolderDiff {
   folderId: string
   title: string
   localOnly: boolean
-  /** False when some cloud items could not be read, so the comparison is partial. */
+  /** False when cloud rows are unreadable or the list count mismatches the folder total. */
   complete: boolean
   /** Cloud rows that could not be parsed; they are excluded from both sides. */
   skipped: number
   localCount: number
   remoteCount: number
+  /** Count reported by the latest cloud folder listing. */
+  expectedRemoteCount?: number
   /** Local works the cloud folder lacks; an explicit writeback adds them. */
   add: Work[]
   /** Cloud works missing locally; writeback never deletes them. */
@@ -587,10 +723,24 @@ export interface Outputs {
     moved: number
     cloudSync: boolean
   }
+  favoriteFolderUpdateWorks: {
+    fromFolderTitle: string
+    addedFolderTitles: string[]
+    removedFolderTitles: string[]
+    updated: number
+    cloudSync: boolean
+  }
+  favoriteFolderAddWorks: {
+    added: number
+    folderTitles: string[]
+    cloudSync: boolean
+  }
   favoriteFolderCreateLocal: FavoriteFolder
   favoriteFolderEditLocal: FavoriteFolder
   favoriteFolderDeleteLocal: { folderId: string; title: string; localCount: number }
-  favoriteStatus: { collected: boolean }
+  favoriteFolderRenameCloud: FavoriteFolder
+  favoriteFolderDeleteCloud: { folderId: string; title: string; localCount: number }
+  favoriteStatus: { collected: boolean; synced: boolean }
   favoriteEditor: FavoriteEditor
   favoriteSave: { collected: true; foldersAdded: number }
   favoriteCreateFolder: FavoriteFolder
@@ -608,14 +758,37 @@ export interface Outputs {
   aiResumeClassification: AiClassificationResult
   aiImportClassificationLog: AiClassificationResult
   aiSuggestFolders: { folderNames: string[] }
-  scanTextWorks: {
-    scanned: number
-    succeeded: number
-    text: number
-    addedText: number
+  fetchMissingCovers: {
+    total: number
+    updated: number
     failed: number
+    failureReasons: DataMaintenanceFailureReason[]
     deferred: number
+    needsVerification: boolean
+    stopped: boolean
   }
+  stopMissingCovers: null
+  syncVideoDurations: {
+    total: number
+    updated: number
+    failed: number
+    failureReasons: DataMaintenanceFailureReason[]
+    deferred: number
+    needsVerification: boolean
+    stopped: boolean
+  }
+  stopVideoDurationSync: null
+  syncMissingAuthorIds: {
+    total: number
+    updated: number
+    failed: number
+    failureReasons: DataMaintenanceFailureReason[]
+    deferred: number
+    needsVerification: boolean
+    stopped: boolean
+  }
+  stopMissingAuthorIds: null
+  resetMissingAuthorIds: null
   aiTestConnection: null
   snapshot: Snapshot
   createAccount: Account
@@ -653,6 +826,7 @@ export interface Outputs {
   backup: { fileName: string }
   dataInfo: DataInfo
   openDataFolder: null
+  openLogFile: null
   pickCoverCacheDirectory: string | null
   clearCache: null
   media: Media

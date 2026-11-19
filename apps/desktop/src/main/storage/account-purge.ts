@@ -17,6 +17,10 @@ export function purgeAccountRows(db: DatabaseSync, accountId: string): void {
     'saved_tasks',
     'saved_updates',
     'collection_tasks',
+    'author_id_refresh_tasks',
+    'duration_refresh_tasks',
+    'cover_refresh_tasks',
+    'cover_refresh_completed',
     'checkpoints',
     'playback_queues',
     'saved_members',
@@ -63,7 +67,7 @@ export function purgeAccountBackups(root: string, accountId: string): void {
         if (source.prepare('PRAGMA quick_check').get()?.quick_check !== 'ok')
           throw new Error('Invalid backup')
         const version = Number(source.prepare('PRAGMA user_version').get()?.user_version)
-        if (version < 1 || version > 8) throw new Error('Unsupported backup version')
+        if (version < 1 || version > 17) throw new Error('Unsupported backup version')
         if (!source.prepare('SELECT 1 FROM accounts WHERE id=?').get(accountId)) continue
         staged.push({ original, temporary })
         source.prepare('VACUUM INTO ?').run(temporary)

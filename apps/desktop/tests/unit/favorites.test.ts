@@ -129,6 +129,20 @@ it('stores favorites and folder scopes independently of likes and other accounts
   expect(store.call('query', { ...query, source: 'favorites' }).total).toBe(2)
   expect(store.call('queueState', { accountId: 'a' })?.work.id).toBe('2')
 })
+it('provides a local favorite-folder thumbnail from a saved member work', () => {
+  const { store } = setup()
+  const works = [work('1'), { ...work('2'), coverUrl: 'https://example.test/cover.jpg' }]
+  let task = store.call('favoritesStart', { accountId: 'a', id: 'thumbnail' })
+  task = save(store, task, { items: works })
+  task = save(store, task, { folders: [{ id: '8', title: '音乐', remoteCount: 2 }] })
+  save(store, task, { items: works })
+
+  expect(store.call('favoriteFolders', { accountId: 'a' })).toEqual(
+    expect.arrayContaining([
+      expect.objectContaining({ id: '8', localCount: 2, coverUrl: 'https://example.test/cover.jpg' })
+    ])
+  )
+})
 it('preserves local folder edits across cloud refresh while keeping write queues opt-in', () => {
   const { store } = setup()
   round(store)

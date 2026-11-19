@@ -18,6 +18,7 @@ docs/
 *.md
 !/README.md
 NVIDIA Corporation/
+exports/
 
 
 .pnpm-store/

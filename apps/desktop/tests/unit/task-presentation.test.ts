@@ -195,9 +195,12 @@ it('distinguishes missing login identity from a mismatched or duplicate local ac
   expect(taskRecovery('DUPLICATE_ACCOUNT')?.message).toContain('已绑定到另一个本地账号')
   expect(taskRecovery('AI_DEEPSEEK_KEY_REQUIRED')?.message).toContain('DeepSeek API Key')
   expect(taskRecovery('AI_SILICONFLOW_KEY_REQUIRED')?.message).toContain('SiliconFlow API Key')
+  expect(taskRecovery('AI_FFMPEG_REQUIRED')?.message).toContain('FFmpeg')
+  expect(taskRecovery('AI_VIDEO_READ_FAILED')?.message).toContain('读取或提取该视频的画面')
   expect(taskRecovery('AI_NETWORK_ERROR')?.message).toContain('网络连接')
   expect(taskRecovery('AI_API_REJECTED')?.message).toContain('账户额度')
   expect(taskRecovery('AI_AUTH_REJECTED')?.message).toContain('对应 AI 平台签发')
+  expect(taskRecovery('AI_ACCESS_REJECTED')?.message).toContain('模型')
   expect(taskRecovery('AI_RESPONSE_INVALID')?.message).toContain('不是抖音登录错误')
 })
 

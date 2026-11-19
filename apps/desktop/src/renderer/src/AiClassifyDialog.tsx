@@ -14,6 +14,7 @@ export function AiClassifyDialog({
   perform,
   close,
   onStart,
+  onError,
   notice,
   aiPending
 }: {
@@ -24,6 +25,7 @@ export function AiClassifyDialog({
   perform: Perform
   close: () => void
   onStart: () => void
+  onError: (message: string) => void
   notice?: (message: string) => void
   aiPending?: { likes: number; favorites: number }
 }) {
@@ -67,10 +69,7 @@ export function AiClassifyDialog({
     )
   ]
   const invalidNames = aiFolderNames.filter((name) => name.length > 30)
-  const canStart =
-    !suggestingNames &&
-    (!createAiFolders || !invalidNames.length) &&
-    (folderIds.length > 0 || (createAiFolders && aiFolderNames.length > 0))
+  const canStart = !suggestingNames && (!createAiFolders || !invalidNames.length)
   const userFolders = folders.filter((folder) => !folder.title.startsWith('AI-'))
   const aiFolders = folders.filter((folder) => folder.title.startsWith('AI-'))
   const toggleFolderSelection = (ids: readonly string[]) => {
@@ -100,33 +99,36 @@ export function AiClassifyDialog({
   }
   const beginClassification = () => {
     if (!accountId || !source) return
-    const operation = source === 'likes' ? '添加喜欢到收藏夹' : '收藏分类'
     close()
     onStart()
-    void perform(operation, async () => {
-      const result = await call(
-        window.mylike.invoke('aiClassifyFavorites', {
-          accountId,
-          source,
-          folderIds,
-          createAiFolders,
-          aiFolderNames: createAiFolders ? aiFolderNames : [],
-          onlyUnclassified
-        })
+    notice?.('AI 分类正在后台运行，你可以继续观看视频；进度可在“连接与任务”查看。')
+    void call(
+      window.mylike.invoke('aiClassifyFavorites', {
+        accountId,
+        source,
+        folderIds,
+        createAiFolders,
+        aiFolderNames: createAiFolders ? aiFolderNames : [],
+        onlyUnclassified
+      })
+    )
+      .then((result) => {
+        const shown = result.failedItems.slice(0, 5)
+        notice?.(
+          [
+            `${source === 'likes' ? '添加喜欢' : '收藏分类'}完成：已记录 ${result.classified} 条，未匹配 ${result.unmatched} 条（未写入），失败 ${result.failed} 条；各收藏夹：${result.folderCounts.map(({ title, count }) => `${title} ${count} 条`).join('、') || '无'}；创建 ${result.foldersCreated} 个收藏夹，使用 ${result.foldersUsed} 个收藏夹。结果已写入本机；如需同步到抖音，请在收藏夹页点击“写回云端”。`,
+            ...shown.map((item) => `失败作品 ${item.workId}（${item.category}）：${item.reason}`),
+            result.failedItems.length > shown.length
+              ? `…另有 ${result.failedItems.length - shown.length} 条失败，可在日志或诊断详情中查看。`
+              : ''
+          ]
+            .filter(Boolean)
+            .join('\n')
+        )
+      })
+      .catch((error) =>
+        onError(error instanceof Error ? error.message : 'AI 自动分类失败，请在“连接与任务”查看详情。')
       )
-      const shown = result.failedItems.slice(0, 5)
-      notice?.(
-        [
-          `${source === 'likes' ? '添加喜欢' : '收藏分类'}完成：已记录 ${result.classified} 条，未匹配 ${result.unmatched} 条（未写入），失败 ${result.failed} 条；各收藏夹：${result.folderCounts.map(({ title, count }) => `${title} ${count} 条`).join('、') || '无'}；创建 ${result.foldersCreated} 个收藏夹，使用 ${result.foldersUsed} 个收藏夹。结果已写入本机；如需同步到抖音，请在收藏夹页点击“写回云端”。`,
-          ...shown.map((item) => `失败作品 ${item.workId}（${item.category}）：${item.reason}`),
-          result.failedItems.length > shown.length
-            ? `…另有 ${result.failedItems.length - shown.length} 条失败，可在日志或诊断详情中查看。`
-            : ''
-        ]
-          .filter(Boolean)
-          .join('\n')
-      )
-    })
   }
 
   const pendingCount = source && aiPending ? aiPending[source] : 0
@@ -192,6 +194,8 @@ export function AiClassifyDialog({
         {source === 'likes'
           ? 'AI 将分析喜欢的作品，并添加到选中的收藏夹；作品可同时归入多个收藏夹。'
           : 'AI 将分析已收藏的作品，并添加到选中的收藏夹；作品可同时归入多个收藏夹。'}
+        超过200字的文案会自动归档到“文学”收藏夹（若不存在则在本机创建）。如需 AI
+        分类其他作品，请选择目标收藏夹。
       </p>
       <details
         className="ai-folder-group"
@@ -408,11 +412,6 @@ export function AiClassifyDialog({
       {createAiFolders && invalidNames.length > 0 && (
         <p className="task-error" role="alert">
           AI 收藏夹名称最多 30 个字符：{invalidNames.join('、')}
-        </p>
-      )}
-      {!canStart && (
-        <p className="task-error" role="alert">
-          请至少选择一个已有收藏夹，或勾选创建并输入收藏夹名称。
         </p>
       )}
     </ConfirmDialog>

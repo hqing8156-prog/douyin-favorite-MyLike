@@ -119,7 +119,10 @@ function FolderDiffPanel({
         ) : null}
         {data ? (
           <small className="favorite-diff-counts">
-            本地 {data.localCount} · 云端 {data.remoteCount}
+            本地 {data.localCount} · 云端{' '}
+            {data.expectedRemoteCount !== undefined && data.expectedRemoteCount !== data.remoteCount
+              ? `记录 ${data.expectedRemoteCount}（本次读取 ${data.remoteCount}）`
+              : data.remoteCount}
           </small>
         ) : null}
       </header>
@@ -172,9 +175,11 @@ function FolderDiffPanel({
           <p className="favorite-diff-summary">
             {data.localOnly
               ? `该收藏夹尚未创建到云端；写回时将新建收藏夹并写入 ${data.localCount} 条作品。`
-              : tab === 'add'
-                ? `这 ${data.add.length} 条只在本地：写回会补写到云端。`
-                : `这 ${data.remoteOnly.length} 条只在云端：写回不会删除，如需一致请使用“同步收藏夹”。`}
+              : !data.complete
+                ? '云端列表数目不一致或含有无法读取的作品；差异仅按已读取作品计算，未读取作品无法导入。'
+                : tab === 'add'
+                  ? `这 ${data.add.length} 条只在本地：写回会补写到云端。`
+                  : `这 ${data.remoteOnly.length} 条只在云端：写回不会删除，如需一致请使用“同步收藏夹”。`}
           </p>
           {data.localOnly || data.add.length || data.remoteOnly.length ? (
             <div className="favorite-diff-toolbar">
@@ -202,7 +207,9 @@ function FolderDiffPanel({
               ? `✓ 仅本地收藏夹，无需核对云端 · ${checkedClock(data.checkedAt)}`
               : data.complete
                 ? `✓ 云端列表已完整核对 · ${checkedClock(data.checkedAt)}`
-                : `⚠ 云端列表不完整（${data.skipped} 条无法读取），差异可能不完整；写回遇到这类作品会停止。`}
+                : data.expectedRemoteCount !== undefined && data.remoteCount !== data.expectedRemoteCount
+                  ? `⚠ 云端记录 ${data.expectedRemoteCount} 条，但本次只读取到 ${data.remoteCount} 条；差异只反映已读取作品，未读取作品不会被导入。`
+                  : `⚠ 云端列表有 ${data.skipped} 条无法读取，差异可能不完整；写回会停止。`}
           </p>
         </>
       ) : null}

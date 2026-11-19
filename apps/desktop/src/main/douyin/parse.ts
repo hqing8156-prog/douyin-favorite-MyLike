@@ -51,6 +51,42 @@ function urls(value: unknown): string[] {
 function first(value: unknown): string | null {
   return urls(value)[0] ?? null
 }
+function imageCover(value: unknown): string | null {
+  const image = object(value)
+  return (
+    first(image.url_list) ??
+    first(object(image.display_image).url_list) ??
+    first(object(image.origin_image).url_list) ??
+    first(image.download_url_list) ??
+    first(object(image.image_url).url_list)
+  )
+}
+function platformDuration(value: unknown): number {
+  const parsed =
+    typeof value === 'number' ? value : typeof value === 'string' && /^\d+$/.test(value) ? Number(value) : 0
+  return Number.isSafeInteger(parsed) && parsed > 0 ? parsed : 0
+}
+const AUTHOR_PROFILE_PREFIX = 'https://www.douyin.com/user/'
+function authorProfileUrl(value: unknown): string | null {
+  const raw = text(value).trim()
+  if (!raw || raw.length > 2048) return null
+  try {
+    const url = new URL(raw)
+    if (
+      url.protocol === 'https:' &&
+      !url.username &&
+      !url.password &&
+      !url.port &&
+      (url.hostname === 'douyin.com' || url.hostname === 'www.douyin.com') &&
+      url.pathname.startsWith('/user/') &&
+      url.pathname.length > '/user/'.length
+    )
+      return url.href
+  } catch {
+    // Fall through to the derived profile URL.
+  }
+  return null
+}
 function pageCursor(value: unknown, hasMore: boolean, collection = false): string {
   let cursor: string
   try {
@@ -306,7 +342,14 @@ export function parseFavoriteFolder(value: unknown): Omit<FavoriteFolder, 'local
 export function parseWork(value: unknown): Work {
   const data = object(value),
     video = object(data.video),
+    durationValue = platformDuration(data.duration) || platformDuration(video.duration),
     author = object(data.author),
+    awemeTypeValue =
+      typeof data.aweme_type === 'number' && Number.isSafeInteger(data.aweme_type)
+        ? data.aweme_type
+        : typeof data.aweme_type === 'string' && /^\d{1,10}$/.test(data.aweme_type)
+          ? Number(data.aweme_type)
+          : null,
     article = jsonObject(data.article_info ?? data.articleInfo),
     articleContent = jsonObject(article.article_content),
     share = jsonObject(data.share_info ?? data.shareInfo),
@@ -335,16 +378,26 @@ export function parseWork(value: unknown): Work {
     typeof author.sec_uid === 'string' && /^[A-Za-z0-9_-]{8,200}$/.test(author.sec_uid)
       ? author.sec_uid
       : null
+  const authorUrl =
+    authorProfileUrl(author.profile_url ?? author.profileUrl ?? data.author_url) ??
+    (authorId ? `${AUTHOR_PROFILE_PREFIX}${authorId}` : null)
   return {
     id: numericId(data.aweme_id),
     title: title.slice(0, 20_000),
     author: text(author.nickname).slice(0, 500),
     authorId,
+    authorUrl,
     publishedAt: Number.isSafeInteger(data.create_time) ? data.create_time : 0,
+    durationMs: Number.isSafeInteger(durationValue) && durationValue > 0 ? durationValue : 0,
     coverUrl:
-      first(video.cover?.url_list) ?? first(video.origin_cover?.url_list) ?? first(images[0]?.url_list),
-    mediaType: isText ? 'text' : images.length ? 'gallery' : 'video',
-    isLive: images.some((image: unknown) => !!(object(image).video || object(image).live_image))
+      first(video.cover?.url_list) ??
+      first(video.origin_cover?.url_list) ??
+      first(video.dynamic_cover?.url_list) ??
+      first(video.ai_dynamic_cover?.url_list) ??
+      imageCover(images[0]),
+    mediaType: isText || awemeTypeValue === 163 ? 'text' : images.length ? 'gallery' : 'video',
+    isLive: images.some((image: unknown) => !!(object(image).video || object(image).live_image)),
+    awemeType: awemeTypeValue
   }
 }
 export function parseLikedPage(
@@ -464,7 +517,7 @@ export function parseMedia(data: Obj): Media {
     ])
   ].slice(0, 12)
   const images = (Array.isArray(value.images) ? value.images : []).map((image: Obj) => {
-    const url = first(image.url_list)
+    const url = imageCover(image)
     if (!url) throw new AppError('INVALID_RESPONSE', '图集存在无法识别的图片地址，未打乱原图顺序。')
     return {
       url,

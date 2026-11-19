@@ -278,6 +278,17 @@ it(
     const { store, file, root } = setup()
     let task = store.call('favoritesStart', { accountId: 'a', id: 'update', mode: 'update' })
     task = save(store, task, { items: [work('1')], cursor: '9', hasMore: true })
+    store.call('saveAuthorIdRefreshCheckpoint', {
+      checkpoint: {
+        accountId: 'a',
+        workIds: ['1'],
+        nextIndex: 0,
+        updated: 0,
+        failed: 0,
+        lastRequestAt: 1,
+        pauseReason: 'manual'
+      }
+    })
     store.call('backup', { reason: 'manual' })
     store.call('close', undefined)
     const reopened = new Store(file)
@@ -290,6 +301,7 @@ it(
     for (const f of [file, ...readdirSync(join(root, 'backups')).map((f) => join(root, 'backups', f))]) {
       const db = new DatabaseSync(f, { readOnly: true })
       expect(db.prepare('SELECT count(*) AS n FROM saved_updates').get()?.n).toBe(0)
+      expect(db.prepare('SELECT count(*) AS n FROM author_id_refresh_tasks').get()?.n).toBe(0)
       expect(db.prepare('PRAGMA foreign_key_check').all()).toHaveLength(0)
       db.close()
     }
@@ -297,7 +309,7 @@ it(
   process.env.CI ? 30_000 : 5_000
 )
 
-it('keeps the v8 core layout and preserves current folder progress after the author ID migration', () => {
+it('keeps the current core layout and preserves current folder progress after the author ID migration', () => {
   const { store, file, root } = setup()
   let task = folders(store, 'sync', 1)
   task = save(store, task, { items: [work('1')], cursor: '5', hasMore: true })
@@ -315,7 +327,13 @@ it('keeps the v8 core layout and preserves current folder progress after the aut
   expect(reopened.call('query', { ...query, folderId: '8' }).items.map((w) => w.id)).toEqual(['1'])
   expect(readdirSync(root).includes('backups')).toBe(false)
   const db = new DatabaseSync(file, { readOnly: true })
-  expect(db.prepare('PRAGMA user_version').get()?.user_version).toBe(8)
+  expect(db.prepare('PRAGMA user_version').get()?.user_version).toBe(17)
+  expect(
+    db
+      .prepare('PRAGMA table_info(works)')
+      .all()
+      .map((row) => row.name)
+  ).toContain('durationMs')
   expect(
     db
       .prepare('PRAGMA table_info(saved_tasks)')

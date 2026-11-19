@@ -110,6 +110,15 @@ it('gives risk and explicit verification precedence over individual content abse
   )
 })
 
+it('explains the short delay required before renaming a newly created cloud folder', () => {
+  expect(() =>
+    parseResponse('{"status_code":3002184}', 200, {
+      operation: 'favoriteFolderCreate',
+      action: '0'
+    })
+  ).toThrow('等待约 30 秒')
+})
+
 it('treats business 2053 as an unavailable detail or a definite rejected uncollect, never an unknown success', () => {
   for (const operation of ['detail', 'favoriteRemove'] as const)
     code(() => parseResponse('{"status_code":2053}', 200, { operation, workId: '1' }), 'CONTENT_UNAVAILABLE')

@@ -156,6 +156,9 @@ export class FavoritesStore {
         `SELECT f.id,l.remoteId,l.localOnly,l.managedLocally,
         coalesce(l.localTitle,f.title) AS title,f.remoteCount,l.isPrivate AS isPrivate,
         (SELECT count(*) FROM saved_members m WHERE m.accountId=f.accountId AND m.folderId=f.id) AS localCount,
+        (SELECT k.coverUrl FROM saved_members m JOIN works k ON k.id=m.workId
+          WHERE m.accountId=f.accountId AND m.folderId=f.id AND nullif(trim(k.coverUrl),'') IS NOT NULL
+          ORDER BY m.rowid DESC LIMIT 1) AS coverUrl,
         (SELECT count(*) FROM favorite_write_ops w
           WHERE w.accountId=f.accountId AND w.folderId=f.id) +
         (SELECT count(*) FROM favorite_member_overrides o
@@ -253,6 +256,48 @@ export class FavoritesStore {
         )
         .run(input.title, input.accountId, input.folderId)
       return this.folders(input.accountId).find((entry) => entry.id === input.folderId)!
+    })
+  }
+  cloudFolderEdit(input: { accountId: string; folderId: string; title: string }): FavoriteFolder {
+    return this.transaction(() => {
+      const folders = this.folders(input.accountId)
+      const folder = folders.find((entry) => entry.id === input.folderId)
+      if (!folder?.remoteId || folder.localOnly || folder.managedLocally)
+        throw new AppError('FOLDER_CHANGED', '云端收藏夹已变化，请重新读取。')
+      if (folders.some((entry) => entry.id !== input.folderId && entry.title === input.title))
+        throw new AppError('FOLDER_EXISTS', '已有同名收藏夹，请选择其他名称。')
+      this.db
+        .prepare('UPDATE saved_folders SET title=? WHERE accountId=? AND id=?')
+        .run(input.title, input.accountId, input.folderId)
+      return this.folders(input.accountId).find((entry) => entry.id === input.folderId)!
+    })
+  }
+  cloudFolderDelete(input: { accountId: string; folderId: string }): {
+    folderId: string
+    title: string
+    localCount: number
+  } {
+    return this.transaction(() => {
+      const folder = this.folders(input.accountId).find((entry) => entry.id === input.folderId)
+      if (!folder?.remoteId || folder.localOnly)
+        throw new AppError('FOLDER_CHANGED', '云端收藏夹已变化，请重新读取。')
+      const result = { folderId: folder.id, title: folder.title, localCount: folder.localCount }
+      this.db
+        .prepare('DELETE FROM favorite_write_ops WHERE accountId=? AND folderId=?')
+        .run(input.accountId, input.folderId)
+      this.db
+        .prepare('DELETE FROM favorite_folder_overrides WHERE accountId=? AND folderId=?')
+        .run(input.accountId, input.folderId)
+      this.db
+        .prepare('DELETE FROM favorite_member_overrides WHERE accountId=? AND folderId=?')
+        .run(input.accountId, input.folderId)
+      this.db
+        .prepare('UPDATE favorite_folder_links SET hiddenLocally=1 WHERE accountId=? AND localId=?')
+        .run(input.accountId, input.folderId)
+      this.db
+        .prepare('DELETE FROM saved_members WHERE accountId=? AND folderId=?')
+        .run(input.accountId, input.folderId)
+      return result
     })
   }
   localFolderDelete(input: { accountId: string; folderId: string }): {
@@ -653,6 +698,25 @@ export class FavoritesStore {
       return null
     })
   }
+  setRemoteCount(input: {
+    accountId: string
+    accountRemoteId: string
+    folderId: string
+    folderRemoteId: string
+    remoteCount: number
+  }): null {
+    return this.transaction(() => {
+      this.verifyIdentity(input.accountId, input.accountRemoteId)
+      const folder = this.folders(input.accountId).find(
+        (entry) => entry.id === input.folderId && entry.remoteId === input.folderRemoteId
+      )
+      if (!folder) throw new AppError('FOLDER_CHANGED', '收藏夹已变化，请重新核对。')
+      this.db
+        .prepare('UPDATE saved_folders SET remoteCount=? WHERE accountId=? AND id=?')
+        .run(Math.max(0, Math.trunc(input.remoteCount)), input.accountId, input.folderId)
+      return null
+    })
+  }
   linkFolder(input: {
     accountId: string
     folderId: string
@@ -735,11 +799,16 @@ export class FavoritesStore {
       )
       .run(accountId, kind, folderId, workId, title, +isPrivate, Date.now())
   }
-  status(accountId: string, workId: string): { collected: boolean } {
+  status(accountId: string, workId: string): { collected: boolean; synced: boolean } {
+    const collected = !!this.db
+      .prepare('SELECT 1 FROM saved_items WHERE accountId=? AND workId=?')
+      .get(accountId, workId)
+    const override = this.db
+      .prepare('SELECT synced FROM favorite_default_overrides WHERE accountId=? AND workId=?')
+      .get(accountId, workId) as { synced: number } | undefined
     return {
-      collected: !!this.db
-        .prepare('SELECT 1 FROM saved_items WHERE accountId=? AND workId=?')
-        .get(accountId, workId)
+      collected,
+      synced: override ? !!override.synced : collected
     }
   }
   private verifyIdentity(accountId: string, remoteId: string): void {
@@ -800,8 +869,8 @@ export class FavoritesStore {
       const work = input.work
       this.db
         .prepare(
-          `INSERT INTO works(id,title,author,publishedAt,coverUrl,mediaType,isLive,authorId) VALUES(?,?,?,?,?,?,?,?) ON CONFLICT(id) DO UPDATE SET
-        title=excluded.title,author=excluded.author,publishedAt=excluded.publishedAt,coverUrl=coalesce(excluded.coverUrl,works.coverUrl),mediaType=excluded.mediaType,isLive=excluded.isLive,authorId=coalesce(excluded.authorId,works.authorId)`
+          `INSERT INTO works(id,title,author,publishedAt,coverUrl,mediaType,isLive,authorId,authorUrl,durationMs,awemeType) VALUES(?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(id) DO UPDATE SET
+        title=excluded.title,author=excluded.author,publishedAt=excluded.publishedAt,coverUrl=coalesce(excluded.coverUrl,works.coverUrl),mediaType=CASE WHEN works.mediaType='text' THEN 'text' ELSE excluded.mediaType END,isLive=excluded.isLive,authorId=coalesce(excluded.authorId,works.authorId),authorUrl=coalesce(excluded.authorUrl,works.authorUrl),durationMs=CASE WHEN excluded.durationMs>0 THEN excluded.durationMs ELSE works.durationMs END,awemeType=coalesce(excluded.awemeType,works.awemeType)`
         )
         .run(
           work.id,
@@ -811,7 +880,10 @@ export class FavoritesStore {
           work.coverUrl,
           work.mediaType,
           +work.isLive,
-          work.authorId ?? null
+          work.authorId ?? null,
+          work.authorUrl ?? null,
+          work.durationMs ?? 0,
+          work.awemeType ?? null
         )
       this.db
         .prepare('INSERT OR IGNORE INTO saved_items VALUES(?,?,?)')
@@ -1133,7 +1205,7 @@ export class FavoritesStore {
   private writeWork(accountId: string, work: Work): number {
     this.db
       .prepare(
-        'INSERT INTO works(id,title,author,publishedAt,coverUrl,mediaType,isLive,authorId) VALUES(?,?,?,?,?,?,?,?) ON CONFLICT(id) DO UPDATE SET title=excluded.title,author=excluded.author,publishedAt=excluded.publishedAt,coverUrl=coalesce(excluded.coverUrl,works.coverUrl),mediaType=excluded.mediaType,isLive=excluded.isLive,authorId=coalesce(excluded.authorId,works.authorId)'
+        "INSERT INTO works(id,title,author,publishedAt,coverUrl,mediaType,isLive,authorId,authorUrl,durationMs,awemeType) VALUES(?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(id) DO UPDATE SET title=excluded.title,author=excluded.author,publishedAt=excluded.publishedAt,coverUrl=coalesce(excluded.coverUrl,works.coverUrl),mediaType=CASE WHEN works.mediaType='text' THEN 'text' ELSE excluded.mediaType END,isLive=excluded.isLive,authorId=coalesce(excluded.authorId,works.authorId),authorUrl=coalesce(excluded.authorUrl,works.authorUrl),durationMs=CASE WHEN excluded.durationMs>0 THEN excluded.durationMs ELSE works.durationMs END,awemeType=coalesce(excluded.awemeType,works.awemeType)"
       )
       .run(
         work.id,
@@ -1143,7 +1215,10 @@ export class FavoritesStore {
         work.coverUrl,
         work.mediaType,
         +work.isLive,
-        work.authorId ?? null
+        work.authorId ?? null,
+        work.authorUrl ?? null,
+        work.durationMs ?? 0,
+        work.awemeType ?? null
       )
     return Number(
       this.db.prepare('INSERT OR IGNORE INTO saved_items VALUES(?,?,?)').run(accountId, work.id, Date.now())

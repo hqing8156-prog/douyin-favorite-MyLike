@@ -13,12 +13,15 @@ import {
   Trash2,
   Shuffle,
   FileText,
+  FolderHeart,
   FolderInput
 } from 'lucide-react'
 import { MAX_BATCH_SIZE, type Account, type Work, type QueueState } from '../../shared/contracts'
 import type { Library } from './useLibrary'
 import { Select } from './Select'
+import { VideoDurationFilter } from './VideoDurationFilter'
 import { AuthorName } from './AuthorName'
+import { CoverImage } from './CoverImage'
 
 type Props = {
   readOnly?: boolean
@@ -27,7 +30,6 @@ type Props = {
   busy: boolean
   mutationBusy: boolean
   collection: { start: () => void; running: boolean; busy: boolean }
-  scanTextWorks: (() => void) | undefined
   play: (work: Work) => void
   login: () => void
   setAdding: Dispatch<SetStateAction<boolean>>
@@ -37,8 +39,15 @@ type Props = {
   folderId?: string | null
   removeFromFolder?: () => void
   moveToFolder?: () => void
+  addToFavorites?: () => void
   copyAuthor: (author: string) => void
-  openAuthor: (authorId: string | null, author: string, workId: string, accountId: string | null) => void
+  openAuthor: (
+    authorId: string | null,
+    author: string,
+    workId: string,
+    accountId: string | null,
+    authorUrl?: string | null
+  ) => void
   playRange: (mode: 'sequence' | 'shuffle') => void
   resume: QueueState | null
   continuePlayback: () => void
@@ -51,7 +60,6 @@ export function LibraryView({
   busy,
   mutationBusy,
   collection,
-  scanTextWorks,
   play,
   login,
   setAdding,
@@ -61,6 +69,7 @@ export function LibraryView({
   folderId,
   removeFromFolder,
   moveToFolder,
+  addToFavorites,
   copyAuthor,
   openAuthor,
   playRange,
@@ -72,6 +81,10 @@ export function LibraryView({
     search,
     type,
     setType,
+    durationFilterEnabled,
+    setDurationFilterEnabled,
+    durationThresholdMinutes,
+    setDurationThresholdMinutes,
     year,
     setYear,
     month,
@@ -84,7 +97,7 @@ export function LibraryView({
     selection,
     pendingChanges
   } = library
-  const filtered = !!(search || type !== 'all' || year || month)
+  const filtered = !!(search || type !== 'all' || durationFilterEnabled || year || month)
   const connected = !!account?.lastVerifiedAt
   return (
     <>
@@ -107,23 +120,21 @@ export function LibraryView({
       )}
       <div className="filter-bar">
         <div className="segmented">
-          {(['all', 'video', 'gallery', 'text'] as const).map((value, i) => (
-            <button
-              key={value}
-              aria-pressed={type === value}
-              className={type === value ? 'selected' : ''}
-              onClick={() => setType(value)}
-            >
-              {['全部内容', '视频', '图集', '文字'][i]}
-            </button>
-          ))}
+          {(['all', 'video', 'gallery', 'text'] as const).map((value, i) => {
+            const selected = type === value
+            return (
+              <button
+                key={value}
+                aria-pressed={selected}
+                className={selected ? 'selected' : ''}
+                onClick={() => setType(value)}
+              >
+                {['全部内容', '视频', '图集', '文字'][i]}
+              </button>
+            )
+          })}
         </div>
         <div className="range-play-actions">
-          {!readOnly && scanTextWorks && (
-            <button disabled={busy || !account} onClick={scanTextWorks} title="批量扫描喜欢内容中的文字作品">
-              扫描文字作品
-            </button>
-          )}
           <button disabled={!page.total || querying || busy} onClick={() => playRange('sequence')}>
             <Play size={14} />
             {selection.ids.size ? '播放所选' : '顺序播放'}
@@ -133,6 +144,12 @@ export function LibraryView({
             {selection.ids.size ? '洗牌所选' : '洗牌播放'}
           </button>
         </div>
+        <VideoDurationFilter
+          enabled={durationFilterEnabled}
+          thresholdMinutes={durationThresholdMinutes}
+          onEnabledChange={setDurationFilterEnabled}
+          onThresholdChange={setDurationThresholdMinutes}
+        />
         <Select
           label="年份筛选"
           value={String(year ?? '')}
@@ -183,6 +200,16 @@ export function LibraryView({
             <button disabled={!selection.ids.size || mutationBusy} onClick={remove}>
               <Trash2 size={14} />
               删除本地条目
+            </button>
+          )}
+          {!readOnly && addToFavorites && (
+            <button
+              disabled={!selection.ids.size || selection.ids.size > MAX_BATCH_SIZE || mutationBusy}
+              onClick={addToFavorites}
+              title="把所选喜欢作品加入一个或多个收藏夹"
+            >
+              <FolderHeart size={14} />
+              添加到收藏夹
             </button>
           )}
           {readOnly && folderId && removeFromFolder && (
@@ -323,18 +350,7 @@ export function LibraryView({
                         title={work.title}
                       >
                         <div className="cover">
-                          {work.coverUrl ? (
-                            <img
-                              loading="lazy"
-                              src={work.coverUrl}
-                              alt=""
-                              onError={(e) => {
-                                e.currentTarget.style.visibility = 'hidden'
-                              }}
-                            />
-                          ) : (
-                            <Heart size={36} />
-                          )}
+                          <CoverImage url={work.coverUrl} size={36} fallback={null} />
                           <span className="type-badge">
                             {work.mediaType === 'text' ? (
                               <FileText size={12} />
@@ -360,6 +376,7 @@ export function LibraryView({
                           <AuthorName
                             author={work.author}
                             authorId={work.authorId ?? null}
+                            authorUrl={work.authorUrl ?? null}
                             workId={work.id}
                             accountId={account?.id ?? null}
                             openAuthor={openAuthor}

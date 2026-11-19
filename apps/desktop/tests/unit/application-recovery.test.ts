@@ -6,7 +6,11 @@ vi.mock('electron', () => ({
 }))
 import { Application } from '../../src/main/application'
 import { AppError } from '../../src/main/errors'
-import { playbackPreferencesSchema } from '../../src/shared/contracts'
+import {
+  playbackPreferencesSchema,
+  type AuthorIdRefreshCheckpoint,
+  type DurationRefreshCheckpoint
+} from '../../src/shared/contracts'
 import { appPreferencesSchema } from '../../src/shared/preferences'
 import type { Database } from '../../src/main/storage/client'
 import type { DouyinEngine } from '../../src/main/douyin/engine'
@@ -109,6 +113,25 @@ function fixture(blocked: string) {
   const pauseFavorites = vi.spyOn(internal.favorites, 'pause')
   return { application, internal, call, engine, pauseLikes, pauseFavorites }
 }
+
+it('keeps the platform request lane available while a background task runs', async () => {
+  const { internal } = fixture('')
+  let entered!: () => void
+  let release!: () => void
+  const enteredTask = new Promise<void>((resolve) => (entered = resolve))
+  const holdTask = new Promise<void>((resolve) => (release = resolve))
+  const task = internal.runBackground('a', async (check: () => void) => {
+    entered()
+    await holdTask
+    check()
+  })
+
+  await enteredTask
+  await expect(internal.lane.run(false, async () => 'media')).resolves.toBe('media')
+  expect(internal.busy).toBe(false)
+  release()
+  await task
+})
 
 it.each([
   ['collectionStart', { accountId: 'a', mode: 'update' }, 'likes'],
@@ -391,4 +414,165 @@ it('coalesces simultaneous status checks into one read-only round', async () => 
     'folders',
     'folderItems'
   ])
+})
+
+it('preserves the current video duration checkpoint when platform risk control pauses the task', async () => {
+  const { internal, call, engine } = fixture('none')
+  const initialCheckpoint = {
+    accountId: 'a',
+    workIds: ['1', '2'],
+    nextIndex: 1,
+    updated: 1,
+    failed: 0,
+    lastRequestAt: Date.now() - 2_000,
+    pauseReason: null
+  }
+  let checkpoint: DurationRefreshCheckpoint | null = initialCheckpoint
+  const baseCall = call.getMockImplementation()!
+  call.mockImplementation(async (method: string, input: any): Promise<any> => {
+    if (method === 'durationRefreshCheckpoint') return checkpoint
+    if (method === 'missingDurationWorks')
+      return [
+        {
+          id: '2',
+          title: 'video',
+          author: 'A',
+          publishedAt: 1,
+          coverUrl: null,
+          mediaType: 'video',
+          isLive: false,
+          durationMs: 0
+        }
+      ]
+    if (method === 'saveDurationRefreshCheckpoint') {
+      checkpoint = input.checkpoint
+      return null
+    }
+    if (method === 'deleteDurationRefreshCheckpoint') {
+      checkpoint = null
+      return null
+    }
+    return baseCall(method, input)
+  })
+  engine.request.mockImplementation(async (_id: string, operation: string) => {
+    if (operation === 'self') return { user: { sec_uid: 'remote-a', nickname: 'A' } }
+    throw new AppError('UPSTREAM_RISK_CONTROL', 'test rate limit')
+  })
+  internal.logs.append = vi.fn(async () => {})
+
+  const result = await internal.syncVideoDurations('a')
+
+  expect(result).toMatchObject({ total: 2, updated: 1, deferred: 1, stopped: false })
+  expect(checkpoint).toMatchObject({
+    workIds: ['1', '2'],
+    nextIndex: 1,
+    updated: 1,
+    pauseReason: 'limited'
+  })
+})
+it('preserves the current author ID checkpoint when platform risk control pauses the task', async () => {
+  const { internal, call, engine } = fixture('none')
+  const initialCheckpoint = {
+    accountId: 'a',
+    workIds: ['1'],
+    nextIndex: 0,
+    updated: 0,
+    failed: 0,
+    lastRequestAt: Date.now() - 2_000,
+    pauseReason: null
+  }
+  let checkpoint: AuthorIdRefreshCheckpoint | null = initialCheckpoint
+  const baseCall = call.getMockImplementation()!
+  call.mockImplementation(async (method: string, input: any): Promise<any> => {
+    if (method === 'authorIdRefreshCheckpoint') return checkpoint
+    if (method === 'missingAuthorIdWorks')
+      return [
+        {
+          id: '1',
+          title: 'video',
+          author: 'A',
+          publishedAt: 1,
+          coverUrl: null,
+          mediaType: 'video',
+          isLive: false,
+          durationMs: 0
+        }
+      ]
+    if (method === 'saveAuthorIdRefreshCheckpoint') {
+      checkpoint = input.checkpoint
+      return null
+    }
+    if (method === 'deleteAuthorIdRefreshCheckpoint') {
+      checkpoint = null
+      return null
+    }
+    return baseCall(method, input)
+  })
+  engine.request.mockImplementation(async (_id: string, operation: string) => {
+    if (operation === 'self') return { user: { sec_uid: 'remote-a', nickname: 'A' } }
+    throw new AppError('UPSTREAM_RISK_CONTROL', 'test rate limit')
+  })
+  internal.logs.append = vi.fn(async () => {})
+
+  const result = await internal.syncMissingAuthorIds('a')
+
+  expect(result).toMatchObject({ total: 1, updated: 0, deferred: 1, stopped: false })
+  expect(checkpoint).toMatchObject({
+    workIds: ['1'],
+    nextIndex: 0,
+    updated: 0,
+    pauseReason: 'limited'
+  })
+})
+it('saves a valid author ID returned by the detail endpoint', async () => {
+  const { internal, call, engine } = fixture('none')
+  const baseCall = call.getMockImplementation()!
+  const updateWork = vi.fn(async (_input: unknown) => null)
+  let checkpoint: AuthorIdRefreshCheckpoint | null = null
+  call.mockImplementation(async (method: string, input: any): Promise<any> => {
+    if (method === 'authorIdRefreshCheckpoint') return checkpoint
+    if (method === 'missingAuthorIdWorks')
+      return [
+        {
+          id: '1',
+          title: 'video',
+          author: 'A',
+          publishedAt: 1,
+          coverUrl: null,
+          mediaType: 'video',
+          isLive: false,
+          durationMs: 0
+        }
+      ]
+    if (method === 'saveAuthorIdRefreshCheckpoint') {
+      checkpoint = input.checkpoint
+      return null
+    }
+    if (method === 'deleteAuthorIdRefreshCheckpoint') {
+      checkpoint = null
+      return null
+    }
+    if (method === 'updateWork') return updateWork(input)
+    return baseCall(method, input)
+  })
+  engine.request.mockImplementation(async (_id: string, operation: string) => {
+    if (operation === 'self') return { user: { sec_uid: 'remote-a', nickname: 'A' } }
+    return {
+      aweme_detail: {
+        aweme_id: '1',
+        author: { nickname: 'A', sec_uid: 'MS4wLjABAAAA_example-123' }
+      }
+    }
+  })
+  internal.logs.append = vi.fn(async () => {})
+
+  const result = await internal.syncMissingAuthorIds('a')
+
+  expect(result).toMatchObject({ total: 1, updated: 1, failed: 0, deferred: 0 })
+  expect(updateWork).toHaveBeenCalledWith(
+    expect.objectContaining({
+      work: expect.objectContaining({ id: '1', authorId: 'MS4wLjABAAAA_example-123' })
+    })
+  )
+  expect(checkpoint).toBeNull()
 })

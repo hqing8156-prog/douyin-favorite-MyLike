@@ -5,7 +5,7 @@ import type { ResponseRule } from '../../shared/runtime-events'
 // Adapted from the response semantics of Evil0ctal/Douyin_TikTok_Download_API
 // v5 (b5505e3). Only public field names and outcomes cross this boundary.
 type Payload = Record<string, unknown>
-export type ResponseContext = { operation?: Operation; workId?: string }
+export type ResponseContext = { operation?: Operation; workId?: string; action?: string }
 const riskCodes = new Set(['8', '2154', '2156', '10000', '10001'])
 const envelopeKeys = new Set(['status_code', 'status_msg', 'message', 'extra', 'log_pb', 'logid', 'log_id'])
 export const contentRead = (operation?: Operation) =>
@@ -55,6 +55,12 @@ export function assertBusinessResponse(data: Payload, context: ResponseContext =
     (commentRead(context.operation) || ['detail', 'favoriteRemove'].includes(context.operation ?? ''))
   )
     throw new AppError('CONTENT_UNAVAILABLE', '平台明确返回此作品当前不可访问。', 'envelope.business_code')
+  if (code === '3002184' && context.operation === 'favoriteFolderCreate' && context.action === '0')
+    throw new AppError(
+      'API_REJECTED',
+      '抖音暂时不允许刚创建的收藏夹立即改名，请等待约 30 秒后重试。',
+      'envelope.rejected'
+    )
   if (riskCodes.has(code ?? '') && context.operation !== 'self')
     throw new AppError(
       'UPSTREAM_RISK_CONTROL',

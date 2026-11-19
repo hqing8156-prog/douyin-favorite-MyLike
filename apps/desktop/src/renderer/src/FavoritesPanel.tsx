@@ -1,12 +1,18 @@
 import { CollectionActions } from './CollectionActions'
-import { useEffect, useState } from 'react'
-import { ScanSearch, Sparkles } from 'lucide-react'
+import { useEffect, useMemo, useState } from 'react'
+import { Cloud, CloudOff, Pencil, Sparkles, Trash2 } from 'lucide-react'
 import type { FavoriteFolder, FavoritesTask, Snapshot } from '../../shared/contracts'
 import type { RecoveryState } from '../../shared/recovery-state'
 import { taskRecovery } from '../../shared/task-recovery'
 import { call, type Perform } from './api'
 import { Select } from './Select'
 import { LocalFoldersDialog } from './LocalFoldersDialog'
+import { FavoriteFolderManagementDialog } from './FavoriteFolderManagementDialog'
+import {
+  readFavoriteFolderVisits,
+  recordFavoriteFolderVisit,
+  sortFavoriteFoldersByVisit
+} from './favorite-folder-recency'
 
 export function FavoriteIssues({ task }: { task: FavoritesTask | null }) {
   return task?.issues?.length ? (
@@ -78,6 +84,7 @@ export function FavoritesPanel({
   setFolderId,
   compact = false,
   snapshot,
+  error,
   notice
 }: {
   snapshot: Snapshot | null
@@ -96,12 +103,34 @@ export function FavoritesPanel({
   recovery?: readonly RecoveryState[]
   login?: () => void
   accessChecks?: readonly { accountId: string; operation: string; at: number }[]
+  error: string
   notice?: (message: string) => void
 }) {
   const latest = snapshot?.favoritesUpdate
   const progress =
     latest && (latest.status === 'running' || latest.updatedAt > (task?.updatedAt ?? 0)) ? latest : task
   const [manageLocalFolders, setManageLocalFolders] = useState(false)
+  const [manageFolder, setManageFolder] = useState<{
+    folder: FavoriteFolder
+    action: 'edit' | 'delete'
+  } | null>(null)
+  const [folderVisits, setFolderVisits] = useState<Record<string, number>>({})
+  useEffect(() => {
+    if (!accountId) {
+      setFolderVisits({})
+      return
+    }
+    try {
+      setFolderVisits(readFavoriteFolderVisits(accountId))
+    } catch (error) {
+      setFolderVisits({})
+      notice?.(`读取收藏夹访问记录失败：${error instanceof Error ? error.message : '本地存储不可用。'}`)
+    }
+  }, [accountId, notice])
+  const sortedFolders = useMemo(
+    () => sortFavoriteFoldersByVisit(folders ?? [], folderVisits),
+    [folders, folderVisits]
+  )
   const selectedFolder = folders?.find((folder) => folder.id === folderId)
   return (
     <section className={compact ? 'favorites-toolbar' : 'panel'} aria-label="收藏同步">
@@ -110,12 +139,68 @@ export function FavoritesPanel({
         <Select
           label="收藏夹筛选"
           value={folderId ?? ''}
+          popupMinWidth={300}
           onChange={(value) => setFolderId(value || null)}
+          onSelect={(value) => {
+            if (!value || !accountId) return
+            try {
+              setFolderVisits(
+                recordFavoriteFolderVisit(
+                  accountId,
+                  value,
+                  sortedFolders.find((folder) => folder.id === value)?.coverUrl
+                )
+              )
+            } catch (error) {
+              notice?.(
+                `保存收藏夹访问记录失败：${error instanceof Error ? error.message : '本地存储不可用。'}`
+              )
+            }
+          }}
+          optionActions={(option) => {
+            const folder = sortedFolders.find((entry) => entry.id === option.value)
+            return folder ? (
+              <>
+                <button
+                  type="button"
+                  aria-label={`编辑 ${folder.title}`}
+                  title="编辑收藏夹"
+                  disabled={busy || !foldersLoaded}
+                  onClick={() => setManageFolder({ folder, action: 'edit' })}
+                >
+                  <Pencil size={14} />
+                </button>
+                <button
+                  type="button"
+                  className="danger-button"
+                  aria-label={`删除 ${folder.title}`}
+                  title="删除收藏夹"
+                  disabled={busy || !foldersLoaded}
+                  onClick={() => setManageFolder({ folder, action: 'delete' })}
+                >
+                  <Trash2 size={14} />
+                </button>
+              </>
+            ) : null
+          }}
           options={[
             { value: '', label: '全部收藏' },
-            ...(folders ?? []).map((folder) => ({
+            ...sortedFolders.map((folder) => ({
               value: folder.id,
-              label: folder.title + ' · ' + folder.localCount
+              label: folder.title + ' · ' + folder.localCount,
+              displayLabel: (
+                <>
+                  <span className="select-option-folder-title">{folder.title}</span>
+                  <span
+                    className="select-option-status"
+                    role="img"
+                    aria-label={folder.remoteId ? '云端有此收藏夹' : '云端没有此收藏夹'}
+                  >
+                    {folder.remoteId ? <Cloud size={14} /> : <CloudOff size={14} />}
+                  </span>
+                  <span className="select-option-folder-count">· {folder.localCount}</span>
+                </>
+              )
             }))
           ]}
         />
@@ -162,6 +247,7 @@ export function FavoritesPanel({
           folders={folders}
           onManageLocalFolders={() => setManageLocalFolders(true)}
           foldersLoaded={foldersLoaded}
+          showCollectionControls={false}
         />
         <button
           disabled={!accountId || busy || !foldersLoaded}
@@ -171,23 +257,6 @@ export function FavoritesPanel({
           <Sparkles size={14} />
           AI 自动分类
         </button>
-        <button
-          disabled={!accountId || busy}
-          onClick={() =>
-            void perform('扫描文字作品', async () => {
-              const result = await call(
-                window.mylike.invoke('scanTextWorks', { accountId: accountId!, source: 'favorites' })
-              )
-              notice?.(
-                `扫描结束：尝试 ${result.scanned} 条，扫描成功 ${result.succeeded} 条，扫描失败 ${result.failed} 条，待稍后扫描 ${result.deferred} 条，识别文字 ${result.text} 条，新增文字 ${result.addedText} 条。`
-              )
-            })
-          }
-          title="批量读取作品详情，识别文字作品"
-        >
-          <ScanSearch size={14} />
-          扫描文字作品
-        </button>
       </div>
       <FavoriteIssues task={task} />
       {manageLocalFolders && accountId && (
@@ -195,8 +264,22 @@ export function FavoritesPanel({
           accountId={accountId}
           folders={folders ?? []}
           busy={busy}
+          error={error}
           perform={perform}
           close={() => setManageLocalFolders(false)}
+          notice={(message) => notice?.(message)}
+        />
+      )}
+      {manageFolder && accountId && (
+        <FavoriteFolderManagementDialog
+          key={`${manageFolder.folder.id}:${manageFolder.action}`}
+          accountId={accountId}
+          folder={manageFolder.folder}
+          initialAction={manageFolder.action}
+          busy={busy}
+          error={error}
+          perform={perform}
+          close={() => setManageFolder(null)}
           notice={(message) => notice?.(message)}
         />
       )}

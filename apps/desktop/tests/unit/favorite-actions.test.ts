@@ -1042,9 +1042,9 @@ it('writes new selected folder memberships to cloud and skips already-present wo
   expect(result).toEqual({ added: 1, folderTitles: ['音乐'], cloudSync: true })
   expect(writes().map((entry) => entry.operation)).toEqual(['favoriteFolderAdd'])
   expect(writes()[0]?.parameters.aweme_id).toBe('2')
-  expect(store.call('favoriteFolders', { accountId: 'a' }).find((entry) => entry.id === folder.id)?.localCount).toBe(
-    2
-  )
+  expect(
+    store.call('favoriteFolders', { accountId: 'a' }).find((entry) => entry.id === folder.id)?.localCount
+  ).toBe(2)
 })
 it('rejects a move to the same folder or an unknown folder and never drops a work whose add failed', async () => {
   const { service, store, platform } = setup(true)

@@ -56,6 +56,236 @@ afterEach(() => {
 })
 
 describe('SQLite transactions and account ownership', () => {
+  it('preserves a stored cover when refreshed work details omit one', () => {
+    const { store } = setup(),
+      original = 'https://p3.douyinpic.com/cover.jpg'
+    store.call('savePage', {
+      accountId: 'a',
+      remoteId: 'remote-a',
+      cursor: '0',
+      hasMore: false,
+      items: [{ ...item('1'), coverUrl: original }]
+    })
+
+    store.call('updateWork', { work: item('1') })
+
+    expect(store.call('query', query).items[0]?.coverUrl).toBe(original)
+    store.call('updateWork', { work: { ...item('1'), coverUrl: 'https://p3.douyinpic.com/new.jpg' } })
+    expect(store.call('query', query).items[0]?.coverUrl).toBe('https://p3.douyinpic.com/new.jpg')
+  })
+
+  it('stores the raw aweme type and never downgrades a text work', () => {
+    const { store } = setup()
+    store.call('savePage', {
+      accountId: 'a',
+      remoteId: 'remote-a',
+      cursor: '0',
+      hasMore: false,
+      items: [{ ...item('1'), awemeType: 163, mediaType: 'text' }]
+    })
+    expect(store.call('query', query).items[0]).toMatchObject({ awemeType: 163, mediaType: 'text' })
+
+    // Later pages may omit the article fields; the stored text mark must survive.
+    store.call('savePage', {
+      accountId: 'a',
+      remoteId: 'remote-a',
+      cursor: '1',
+      hasMore: false,
+      items: [item('1')]
+    })
+    store.call('updateWork', { work: item('1') })
+    expect(store.call('query', query).items[0]).toMatchObject({ awemeType: 163, mediaType: 'text' })
+  })
+
+  it('pages only works without covers that belong to the requested account', () => {
+    const { store } = setup()
+    store.call('savePage', {
+      accountId: 'a',
+      remoteId: 'remote-a',
+      cursor: '0',
+      hasMore: false,
+      items: [
+        item('1'),
+        { ...item('2'), coverUrl: 'https://p3.douyinpic.com/cover.jpg' },
+        { ...item('4'), coverUrl: 'https://p3.douyinpic.com/gallery.jpg', mediaType: 'gallery' },
+        { ...item('5'), coverUrl: 'https://p3.douyinpic.com/live.jpg', isLive: true },
+        { ...item('6'), mediaType: 'gallery' }
+      ]
+    })
+    store.call('createAccount', { id: 'b', name: 'B' })
+    store.call('bindAccount', { accountId: 'b', remoteId: 'remote-b', nickname: 'B', avatarUrl: null })
+    store.call('savePage', {
+      accountId: 'b',
+      remoteId: 'remote-b',
+      cursor: '0',
+      hasMore: false,
+      items: [item('3')]
+    })
+
+    expect(
+      store.call('missingCoverWorks', { accountId: 'a', offset: 0, limit: 10 }).map((work) => work.id)
+    ).toEqual(['6', '5', '1'])
+    expect(
+      store.call('missingCoverWorks', { accountId: 'b', offset: 0, limit: 1 }).map((work) => work.id)
+    ).toEqual(['3'])
+
+    store.call('coverRefreshSaveWork', {
+      accountId: 'a',
+      work: { ...item('4'), coverUrl: 'https://p3.douyinpic.com/refreshed.jpg', mediaType: 'gallery' }
+    })
+    expect(
+      store.call('missingCoverWorks', { accountId: 'a', offset: 0, limit: 10 }).map((work) => work.id)
+    ).toEqual(['6', '5', '1'])
+    expect(
+      store.call('missingCoverWorks', { accountId: 'b', offset: 0, limit: 10 }).map((work) => work.id)
+    ).toEqual(['3'])
+  })
+  it('finds only unknown video durations across likes and favorites for the requested account', () => {
+    const { store } = setup()
+    store.call('savePage', {
+      accountId: 'a',
+      remoteId: 'remote-a',
+      cursor: '0',
+      hasMore: false,
+      items: [item('1'), { ...item('2'), durationMs: 120_000 }, { ...item('3'), mediaType: 'gallery' }]
+    })
+    store.call('favoriteConfirm', {
+      accountId: 'a',
+      remoteId: 'remote-a',
+      work: item('4')
+    })
+    store.call('createAccount', { id: 'b', name: 'B' })
+    store.call('bindAccount', { accountId: 'b', remoteId: 'remote-b', nickname: 'B', avatarUrl: null })
+    store.call('savePage', {
+      accountId: 'b',
+      remoteId: 'remote-b',
+      cursor: '0',
+      hasMore: false,
+      items: [item('5')]
+    })
+
+    expect(
+      store.call('missingDurationWorks', { accountId: 'a', offset: 0, limit: 10 }).map((w) => w.id)
+    ).toEqual(['4', '1'])
+    expect(
+      store.call('missingDurationWorks', { accountId: 'b', offset: 0, limit: 10 }).map((w) => w.id)
+    ).toEqual(['5'])
+
+    store.call('updateWork', { work: { ...item('1'), durationMs: 45_000 } })
+    expect(
+      store.call('missingDurationWorks', { accountId: 'a', offset: 0, limit: 10 }).map((w) => w.id)
+    ).toEqual(['4'])
+  })
+  it('finds works missing author ID, cover or video duration for the requested account', () => {
+    const { store } = setup()
+    store.call('savePage', {
+      accountId: 'a',
+      remoteId: 'remote-a',
+      cursor: '0',
+      hasMore: false,
+      items: [
+        item('1'),
+        { ...item('2'), authorId: 'MS4wLjABAAAA_example-123' },
+        { ...item('3'), authorId: 'invalid id' },
+        { ...item('4'), mediaType: 'gallery' },
+        { ...item('7'), mediaType: 'text' }
+      ]
+    })
+    store.call('favoriteConfirm', {
+      accountId: 'a',
+      remoteId: 'remote-a',
+      work: item('5')
+    })
+    store.call('createAccount', { id: 'b', name: 'B' })
+    store.call('bindAccount', { accountId: 'b', remoteId: 'remote-b', nickname: 'B', avatarUrl: null })
+    store.call('savePage', {
+      accountId: 'b',
+      remoteId: 'remote-b',
+      cursor: '0',
+      hasMore: false,
+      items: [item('6')]
+    })
+
+    expect(
+      store.call('missingAuthorIdWorks', { accountId: 'a', offset: 0, limit: 10 }).map((w) => w.id)
+    ).toEqual(['7', '5', '4', '3', '2', '1'])
+    expect(
+      store.call('missingAuthorIdWorks', { accountId: 'b', offset: 0, limit: 10 }).map((w) => w.id)
+    ).toEqual(['6'])
+
+    store.call('updateWork', {
+      work: {
+        ...item('1'),
+        authorId: 'MS4wLjABAAAA_example-456',
+        coverUrl: 'https://p3.douyinpic.com/cover.jpg',
+        durationMs: 60_000
+      }
+    })
+    expect(
+      store.call('missingAuthorIdWorks', { accountId: 'a', offset: 0, limit: 10 }).map((w) => w.id)
+    ).toEqual(['7', '5', '4', '3', '2'])
+  })
+  it('persists cover refresh checkpoints and resumes them after reopening', () => {
+    const { file, store } = setup()
+    const checkpoint = {
+      accountId: 'a',
+      workIds: ['123', '456'],
+      nextIndex: 1,
+      updated: 1,
+      failed: 0,
+      lastRequestAt: 1_700_000_000_000,
+      pauseReason: 'limited' as const
+    }
+    store.call('saveCoverRefreshCheckpoint', { checkpoint })
+    store.call('close', undefined)
+
+    const reopened = new Store(file)
+    stores.push(reopened)
+    expect(reopened.call('coverRefreshCheckpoint', { accountId: 'a' })).toEqual(checkpoint)
+    reopened.call('deleteCoverRefreshCheckpoint', { accountId: 'a' })
+    expect(reopened.call('coverRefreshCheckpoint', { accountId: 'a' })).toBeNull()
+  })
+  it('persists video duration checkpoints and resumes them after reopening', () => {
+    const { file, store } = setup()
+    const checkpoint = {
+      accountId: 'a',
+      workIds: ['123', '456'],
+      nextIndex: 1,
+      updated: 1,
+      failed: 0,
+      lastRequestAt: 1_700_000_000_000,
+      pauseReason: 'limited' as const
+    }
+    store.call('saveDurationRefreshCheckpoint', { checkpoint })
+    store.call('close', undefined)
+
+    const reopened = new Store(file)
+    stores.push(reopened)
+    expect(reopened.call('durationRefreshCheckpoint', { accountId: 'a' })).toEqual(checkpoint)
+    reopened.call('deleteDurationRefreshCheckpoint', { accountId: 'a' })
+    expect(reopened.call('durationRefreshCheckpoint', { accountId: 'a' })).toBeNull()
+  })
+  it('persists author ID refresh checkpoints and resumes them after reopening', () => {
+    const { file, store } = setup()
+    const checkpoint = {
+      accountId: 'a',
+      workIds: ['123', '456'],
+      nextIndex: 1,
+      updated: 1,
+      failed: 0,
+      lastRequestAt: 1_700_000_000_000,
+      pauseReason: 'limited' as const
+    }
+    store.call('saveAuthorIdRefreshCheckpoint', { checkpoint })
+    store.call('close', undefined)
+
+    const reopened = new Store(file)
+    stores.push(reopened)
+    expect(reopened.call('authorIdRefreshCheckpoint', { accountId: 'a' })).toEqual(checkpoint)
+    reopened.call('deleteAuthorIdRefreshCheckpoint', { accountId: 'a' })
+    expect(reopened.call('authorIdRefreshCheckpoint', { accountId: 'a' })).toBeNull()
+  })
+
   it('persists author IDs and preserves them when later updates omit the identifier', () => {
     const { store } = setup()
     store.call('savePage', {
@@ -76,6 +306,43 @@ describe('SQLite transactions and account ownership', () => {
     expect(store.call('libraryOverview', { accountId: 'a' }).recent).toMatchObject([
       { id: '1', authorId: 'MS4wLjABAAAA_example-123' }
     ])
+  })
+  it('adds duration storage when upgrading a v10 database', () => {
+    const { file, store } = setup()
+    store.call('savePage', {
+      accountId: 'a',
+      remoteId: 'remote-a',
+      cursor: '0',
+      hasMore: false,
+      items: [item('1')]
+    })
+    store.call('close', undefined)
+
+    const legacy = new DatabaseSync(file)
+    legacy.exec(
+      'ALTER TABLE works DROP COLUMN durationMs; DROP TABLE duration_refresh_tasks; PRAGMA user_version=10;'
+    )
+    legacy.close()
+    const upgraded = new Store(file)
+    stores.push(upgraded)
+
+    expect(upgraded.call('query', query).items[0]).toMatchObject({ id: '1', durationMs: 0 })
+    const version = new DatabaseSync(file)
+    expect(version.prepare('PRAGMA user_version').get()?.user_version).toBe(17)
+    expect(
+      version
+        .prepare("SELECT name FROM sqlite_master WHERE type='table' AND name='duration_refresh_tasks'")
+        .get()
+    ).toBeTruthy()
+    expect(
+      version
+        .prepare("SELECT name FROM sqlite_master WHERE type='table' AND name='author_id_refresh_tasks'")
+        .get()
+    ).toBeTruthy()
+    expect(
+      (version.prepare('PRAGMA table_info(works)').all() as { name: string }[]).map((row) => row.name)
+    ).toContain('authorUrl')
+    version.close()
   })
 
   it('aggregates account-wide dashboard counts with bounded recent items and no cross-account rows', () => {
@@ -126,6 +393,35 @@ describe('SQLite transactions and account ownership', () => {
       galleries: 0,
       live: 0
     })
+  })
+  it('counts popular liked authors across all work types and excludes favorites', () => {
+    const { store } = setup()
+    store.call('savePage', {
+      accountId: 'a',
+      remoteId: 'remote-a',
+      cursor: '0',
+      hasMore: false,
+      items: [
+        { ...item('1'), author: '创作者甲', authorId: 'creator-a' },
+        { ...item('2'), author: '创作者甲', authorId: 'creator-a' },
+        { ...item('3'), author: '创作者甲', authorId: 'creator-a', mediaType: 'gallery' },
+        { ...item('4'), author: '创作者甲', authorId: 'creator-a', mediaType: 'text' },
+        { ...item('11'), author: '创作者乙', authorId: 'creator-b' },
+        { ...item('12'), author: '创作者乙', authorId: 'creator-b' },
+        { ...item('21'), author: '创作者丙', authorId: 'creator-c', mediaType: 'gallery' }
+      ]
+    })
+    for (let index = 0; index < 3; index++)
+      store.call('favoriteConfirm', {
+        accountId: 'a',
+        remoteId: 'remote-a',
+        work: { ...item(String(index + 31)), author: '仅收藏作者', authorId: 'creator-favorite' }
+      })
+
+    expect(store.call('libraryOverview', { accountId: 'a' }).authors).toEqual([
+      { authorId: 'creator-a', name: '创作者甲', total: 4, videos: 2, galleries: 1, texts: 1 }
+    ])
+    expect(store.call('query', { ...query, search: 'creator-a' }).total).toBe(4)
   })
   it('persists page and cursor together, is idempotent, and survives reopening', () => {
     const { store, file } = setup()
@@ -221,6 +517,30 @@ describe('SQLite transactions and account ownership', () => {
       '2',
       '1'
     ])
+  })
+  it('filters videos strictly above the entered duration for both pages and batch selections', () => {
+    const { store } = setup()
+    store.call('savePage', {
+      accountId: 'a',
+      remoteId: 'remote-a',
+      cursor: '0',
+      hasMore: false,
+      items: [
+        { ...item('1'), durationMs: 59_999 },
+        { ...item('2'), durationMs: 60_000 },
+        { ...item('3'), durationMs: 60_001 },
+        { ...item('4'), durationMs: 90_000 },
+        { ...item('5'), mediaType: 'gallery', durationMs: 120_000 }
+      ]
+    })
+
+    const filter = { ...query, durationGreaterThanMs: 60_000 }
+    expect(store.call('query', filter).items.map((work) => work.id)).toEqual(['4', '3'])
+    expect(store.call('matchingIds', filter)).toEqual(['4', '3'])
+    expect(store.call('query', { ...query, mediaType: 'gallery', durationGreaterThanMs: 60_000 }).total).toBe(
+      0
+    )
+    expect(store.call('query', { ...query, durationGreaterThanMs: null }).total).toBe(5)
   })
   it('selects the full filtered set and preserves that snapshot while new content arrives; local deletion stays account-scoped', () => {
     const { store, file } = setup(),
@@ -380,6 +700,19 @@ describe('SQLite transactions and account ownership', () => {
     })
     expect(store.call('query', { ...query, search: '作者' }).items.map((work) => work.id)).toEqual([
       '7672255161846976246'
+    ])
+  })
+  it('finds videos without captions by their unnamed-work label', () => {
+    const { store } = setup()
+    store.call('savePage', {
+      accountId: 'a',
+      remoteId: 'remote-a',
+      items: [{ ...item('blank-caption'), title: '' }],
+      cursor: '0',
+      hasMore: false
+    })
+    expect(store.call('query', { ...query, search: '未命名作品' }).items.map((work) => work.id)).toEqual([
+      'blank-caption'
     ])
   })
 })

@@ -33,12 +33,32 @@ const allowedPage = (value: string): boolean => {
     return false
   }
 }
+const authorProfilePage = (value: string): boolean => {
+  if (!value || value.length > 2048) return false
+  try {
+    const url = new URL(value)
+    return (
+      url.protocol === 'https:' &&
+      !url.username &&
+      !url.password &&
+      !url.port &&
+      (url.hostname === 'douyin.com' || url.hostname === 'www.douyin.com') &&
+      url.pathname.startsWith('/user/') &&
+      url.pathname.length > '/user/'.length
+    )
+  } catch {
+    return false
+  }
+}
 const guardedSessions = new WeakSet<Electron.Session>()
 type PageReply = { id?: unknown; error?: unknown; body?: unknown; status?: unknown }
 
 export class DouyinEngine {
   private readonly recoveryGate = new RecoveryGate()
   private window: BrowserWindow | null = null
+  private authorWindow: BrowserWindow | null = null
+  private authorAccountId: string | null = null
+  private authorProfileId: string | null = null
   private accountId: string | null = null
   private status: EngineStatus = 'stopped'
   private documentCommitted = false
@@ -167,6 +187,77 @@ export class DouyinEngine {
       guardedSessions.add(partition)
     }
     return partition
+  }
+  async openAuthorProfile(accountId: string, authorId?: string, authorUrl?: string): Promise<void> {
+    const target = authorUrl?.trim()
+      ? authorUrl.trim()
+      : authorId && /^[A-Za-z0-9_-]{8,200}$/.test(authorId)
+        ? `https://www.douyin.com/user/${authorId}`
+        : ''
+    if (!authorProfilePage(target)) throw new AppError('INVALID_INPUT', '作者主页地址无效。')
+    let win = this.authorWindow
+    if (win && !win.isDestroyed() && this.authorAccountId === accountId) {
+      win.show()
+      win.focus()
+      if (this.authorProfileId === target) return
+      this.authorProfileId = target
+      try {
+        await win.loadURL(target)
+        return
+      } catch {
+        if (this.authorWindow !== win || this.authorProfileId !== target) return
+        win.destroy()
+        this.authorWindow = null
+        this.authorAccountId = null
+        this.authorProfileId = null
+        throw new AppError('OPEN_BROWSER_FAILED', '无法打开作者主页，请稍后重试。')
+      }
+    }
+    if (win && !win.isDestroyed()) win.destroy()
+    const parent = this.parent()
+    win = new BrowserWindow({
+      width: 1120,
+      height: 800,
+      show: false,
+      title: '抖音作者主页 — MyLike',
+      autoHideMenuBar: true,
+      ...(parent ? { parent } : {}),
+      webPreferences: {
+        session: this.partition(accountId),
+        contextIsolation: true,
+        nodeIntegration: false,
+        sandbox: true,
+        autoplayPolicy: 'user-gesture-required'
+      }
+    })
+    this.authorWindow = win
+    this.authorAccountId = accountId
+    this.authorProfileId = target
+    win.on('closed', () => {
+      if (this.authorWindow !== win) return
+      this.authorWindow = null
+      this.authorAccountId = null
+      this.authorProfileId = null
+    })
+    win.webContents.setWindowOpenHandler(() => ({ action: 'deny' }))
+    win.webContents.on('will-navigate', (event, url) => {
+      if (!allowedPage(url)) event.preventDefault()
+    })
+    win.webContents.on('will-redirect', (event, url) => {
+      if (!allowedPage(url)) event.preventDefault()
+    })
+    try {
+      await win.loadURL(target)
+      if (this.authorWindow !== win || this.authorProfileId !== target) return
+      win.show()
+    } catch {
+      if (this.authorWindow !== win || this.authorProfileId !== target) return
+      if (!win.isDestroyed()) win.destroy()
+      this.authorWindow = null
+      this.authorAccountId = null
+      this.authorProfileId = null
+      throw new AppError('OPEN_BROWSER_FAILED', '无法打开作者主页，请稍后重试。')
+    }
   }
   private update(status: EngineStatus) {
     this.status = status
@@ -503,7 +594,11 @@ export class DouyinEngine {
         throw new AppError('INVALID_RESPONSE', '接口响应格式不正确。')
       status = reply.status
       summary = responseSummary(reply.body, reply.status, operation)
-      const data = parseResponse(reply.body, reply.status, { operation, workId: parameters.aweme_id })
+      const data = parseResponse(reply.body, reply.status, {
+        operation,
+        workId: parameters.aweme_id,
+        action: parameters.action
+      })
       if (operation === 'self') parseIdentity(data)
       // Preserve a confirmed write promptly. A challenge detected afterward
       // affects subsequent operations, not this response's known outcome.
@@ -590,7 +685,12 @@ export class DouyinEngine {
         this.observer?.(accountId, {
           kind: 'request',
           message: failureMessage ?? '接口已返回',
-          operation,
+          operation:
+            operation === 'favoriteFolderCreate' && parameters.action === '0'
+              ? 'favoriteFolderRenameCloud'
+              : operation === 'favoriteFolderCreate' && parameters.action === '2'
+                ? 'favoriteFolderDeleteCloud'
+                : operation,
           ...summary,
           ...(status === undefined ? {} : { status }),
           ...(code ? { code } : {}),

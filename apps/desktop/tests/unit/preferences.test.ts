@@ -128,7 +128,7 @@ it('persists application and playback preferences across restart without changin
     rememberWindow: false,
     deepseekApiKey: '',
     siliconFlowApiKey: '',
-    favoriteCategoryHints: '',
+    aiVideoInspection: true,
     syncFavoritesToCloud: false,
     autoContinueWriteback: false,
     writebackBatchIntervalSec: 60,

@@ -1,9 +1,16 @@
 type Props = {
   author: string
   authorId: string | null
+  authorUrl?: string | null
   workId: string
   accountId: string | null
-  openAuthor: (authorId: string | null, author: string, workId: string, accountId: string | null) => void
+  openAuthor: (
+    authorId: string | null,
+    author: string,
+    workId: string,
+    accountId: string | null,
+    authorUrl?: string | null
+  ) => void
   copyAuthor: (author: string) => void
   className?: string
 }
@@ -11,6 +18,7 @@ type Props = {
 export function AuthorName({
   author,
   authorId,
+  authorUrl,
   workId,
   accountId,
   openAuthor,
@@ -28,7 +36,7 @@ export function AuthorName({
       title="左键打开作者主页；右键复制作者名称"
       onClick={(event) => {
         event.stopPropagation()
-        openAuthor(authorId, author, workId, accountId)
+        openAuthor(authorId, author, workId, accountId, authorUrl)
       }}
       onContextMenu={(event) => {
         event.preventDefault()
@@ -43,7 +51,7 @@ export function AuthorName({
         } else if (event.key === 'Enter' || event.key === ' ') {
           event.preventDefault()
           event.stopPropagation()
-          openAuthor(authorId, author, workId, accountId)
+          openAuthor(authorId, author, workId, accountId, authorUrl)
         }
       }}
     >

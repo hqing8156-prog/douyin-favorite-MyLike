@@ -9,6 +9,7 @@ export function LocalFoldersDialog({
   accountId,
   folders,
   busy,
+  error,
   perform,
   close,
   notice
@@ -16,6 +17,7 @@ export function LocalFoldersDialog({
   accountId: string
   folders: FavoriteFolder[]
   busy: boolean
+  error: string
   perform: Perform
   close: () => void
   notice: (message: string) => void
@@ -27,12 +29,21 @@ export function LocalFoldersDialog({
   const [privateFolder, setPrivateFolder] = useState(true)
   const managedFolders = folders.filter((folder) => folder.managedLocally)
 
+  // Keep a single modal on screen: hide the list while the delete
+  // confirmation is open, and restore it when the confirmation is cancelled.
   useEffect(() => {
-    dialog.current?.showModal()
-    return () => {
+    const node = dialog.current
+    if (!node) return
+    if (deleteTarget) {
+      if (node.open) node.close()
+    } else if (!node.open) node.showModal()
+  }, [deleteTarget])
+  useEffect(
+    () => () => {
       if (dialog.current?.open) dialog.current.close()
-    }
-  }, [])
+    },
+    []
+  )
 
   const resetForm = () => {
     setEditingId(null)
@@ -184,6 +195,11 @@ export function LocalFoldersDialog({
             <p className="local-folders-empty">还没有本地创建的收藏夹。</p>
           )}
         </div>
+        {error && (
+          <p className="favorite-error" role="alert">
+            {error}
+          </p>
+        )}
       </dialog>
       {deleteTarget && (
         <ConfirmDialog
@@ -202,6 +218,11 @@ export function LocalFoldersDialog({
           <p>
             <strong>作品仍保留在默认收藏列表中，不会取消抖音收藏或点赞。</strong>
           </p>
+          {error && (
+            <p className="task-error" role="alert">
+              {error}
+            </p>
+          )}
         </ConfirmDialog>
       )}
     </>

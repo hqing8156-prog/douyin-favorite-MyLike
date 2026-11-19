@@ -144,8 +144,56 @@ export function GalleryProgress({
   progress: number
   select: (index: number) => void
 }) {
+  const root = useRef<HTMLDivElement>(null),
+    pointer = useRef<number | null>(null),
+    lastSelected = useRef(active),
+    dragged = useRef(false)
   return (
-    <div className="gallery-progress" role="tablist" aria-label="图集进度">
+    <div
+      ref={root}
+      className="gallery-progress"
+      role="tablist"
+      aria-label="图集进度"
+      onPointerDown={(event) => {
+        if (event.button !== 0 || !(event.target instanceof HTMLButtonElement)) return
+        pointer.current = event.pointerId
+        lastSelected.current = active
+        dragged.current = false
+        event.target.setPointerCapture(event.pointerId)
+      }}
+      onPointerMove={(event) => {
+        if (pointer.current !== event.pointerId) return
+        const bounds = root.current?.getBoundingClientRect()
+        if (!bounds || !bounds.width) return
+        const index = Math.min(
+          count - 1,
+          Math.max(0, Math.floor(((event.clientX - bounds.left) / bounds.width) * count))
+        )
+        if (index !== lastSelected.current) {
+          dragged.current = true
+          lastSelected.current = index
+          select(index)
+        }
+      }}
+      onPointerUp={(event) => {
+        if (pointer.current === event.pointerId) {
+          pointer.current = null
+          if (dragged.current) window.setTimeout(() => (dragged.current = false), 0)
+        }
+      }}
+      onPointerCancel={(event) => {
+        if (pointer.current === event.pointerId) {
+          pointer.current = null
+          dragged.current = false
+        }
+      }}
+      onClickCapture={(event) => {
+        if (!dragged.current) return
+        event.preventDefault()
+        event.stopPropagation()
+        dragged.current = false
+      }}
+    >
       {Array.from({ length: count }, (_, index) => {
         const value = index < active ? 100 : index === active ? progress * 100 : 0
         return (
@@ -156,7 +204,10 @@ export function GalleryProgress({
             aria-label={`第 ${index + 1} 张`}
             aria-selected={index === active}
             style={{ '--segment-progress': `${Math.max(0, Math.min(100, value))}%` } as CSSProperties}
-            onClick={() => select(index)}
+            onClick={() => {
+              lastSelected.current = index
+              select(index)
+            }}
           />
         )
       })}
@@ -167,6 +218,7 @@ export function GalleryProgress({
 export function MediaCaption({
   author,
   authorId,
+  authorUrl,
   workId,
   accountId,
   title,
@@ -180,6 +232,7 @@ export function MediaCaption({
 }: {
   author: string
   authorId: string | null
+  authorUrl?: string | null
   workId: string
   accountId: string
   title: string
@@ -188,7 +241,13 @@ export function MediaCaption({
   expanded: boolean
   toggle: () => void
   hint: string
-  openAuthor: (authorId: string | null, author: string, workId: string, accountId: string | null) => void
+  openAuthor: (
+    authorId: string | null,
+    author: string,
+    workId: string,
+    accountId: string | null,
+    authorUrl?: string | null
+  ) => void
   copyAuthor: (author: string) => void
 }) {
   const [overflow, setOverflow] = useState(false)
@@ -211,6 +270,7 @@ export function MediaCaption({
         <AuthorName
           author={author}
           authorId={authorId}
+          authorUrl={authorUrl}
           workId={workId}
           accountId={accountId}
           openAuthor={openAuthor}

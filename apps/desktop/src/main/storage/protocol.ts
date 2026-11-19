@@ -17,7 +17,10 @@ import type {
   Outputs,
   UnlikeTask,
   UnlikeItem,
-  PendingFavoriteWrite
+  PendingFavoriteWrite,
+  CoverRefreshCheckpoint,
+  DurationRefreshCheckpoint,
+  AuthorIdRefreshCheckpoint
 } from '../../shared/contracts'
 import type { FavoritesPage } from './favorites'
 import type { AppPreferences, WindowState } from '../../shared/preferences'
@@ -65,6 +68,8 @@ export interface Inputs {
   }
   favoriteLocalFolderEdit: { accountId: string; folderId: string; title: string }
   favoriteLocalFolderDelete: { accountId: string; folderId: string }
+  favoriteCloudFolderEdit: { accountId: string; folderId: string; title: string }
+  favoriteCloudFolderDelete: { accountId: string; folderId: string }
   favoriteQueueWrite: {
     accountId: string
     remoteId: string
@@ -86,6 +91,13 @@ export interface Inputs {
   }
   favoriteWriteOps: { accountId: string }
   favoriteWriteComplete: { accountId: string; operationId: number }
+  favoriteFolderSetRemoteCount: {
+    accountId: string
+    accountRemoteId: string
+    folderId: string
+    folderRemoteId: string
+    remoteCount: number
+  }
   favoriteLinkFolder: {
     accountId: string
     folderId: string
@@ -130,6 +142,20 @@ export interface Inputs {
   aiAssignmentStats: { accountId: string }
   unclassifiedWorkIds: { accountId: string; source: 'likes' | 'favorites' }
   worksByIds: { workIds: string[] }
+  missingCoverWorks: { accountId: string; offset: number; limit: number }
+  missingDurationWorks: { accountId: string; offset: number; limit: number }
+  missingAuthorIdWorks: { accountId: string; offset: number; limit: number }
+  durationRefreshCheckpoint: { accountId: string }
+  saveDurationRefreshCheckpoint: { checkpoint: DurationRefreshCheckpoint }
+  deleteDurationRefreshCheckpoint: { accountId: string }
+  authorIdRefreshCheckpoint: { accountId: string }
+  saveAuthorIdRefreshCheckpoint: { checkpoint: AuthorIdRefreshCheckpoint }
+  deleteAuthorIdRefreshCheckpoint: { accountId: string }
+  coverRefreshCheckpoint: { accountId: string }
+  saveCoverRefreshCheckpoint: { checkpoint: CoverRefreshCheckpoint }
+  deleteCoverRefreshCheckpoint: { accountId: string }
+  coverRefreshMarkCompleted: { accountId: string; workIds: string[] }
+  coverRefreshSaveWork: { accountId: string; work: Work }
   updateWork: { work: Work }
   accounts: undefined
   createAccount: { id: string; name: string }
@@ -231,6 +257,8 @@ export interface Replies {
   favoriteLocalFolderCreate: FavoriteFolder
   favoriteLocalFolderEdit: FavoriteFolder
   favoriteLocalFolderDelete: { folderId: string; title: string; localCount: number }
+  favoriteCloudFolderEdit: FavoriteFolder
+  favoriteCloudFolderDelete: { folderId: string; title: string; localCount: number }
   favoriteQueueWrite: null
   favoriteWritePending: number
   favoriteWritebackPending: { total: number; items: PendingFavoriteWrite[] }
@@ -248,8 +276,9 @@ export interface Replies {
     private: boolean | null
   }[]
   favoriteWriteComplete: null
+  favoriteFolderSetRemoteCount: null
   favoriteLinkFolder: null
-  favoriteStatus: { collected: boolean }
+  favoriteStatus: { collected: boolean; synced: boolean }
   favoriteWriteGuard: null
   favoriteRememberFolder: FavoriteFolder
   favoriteConfirm: null
@@ -261,6 +290,20 @@ export interface Replies {
   aiAssignmentStats: { likes: number; favorites: number }
   unclassifiedWorkIds: string[]
   worksByIds: Work[]
+  missingCoverWorks: Work[]
+  missingDurationWorks: Work[]
+  missingAuthorIdWorks: Work[]
+  durationRefreshCheckpoint: DurationRefreshCheckpoint | null
+  saveDurationRefreshCheckpoint: null
+  deleteDurationRefreshCheckpoint: null
+  authorIdRefreshCheckpoint: AuthorIdRefreshCheckpoint | null
+  saveAuthorIdRefreshCheckpoint: null
+  deleteAuthorIdRefreshCheckpoint: null
+  coverRefreshCheckpoint: CoverRefreshCheckpoint | null
+  saveCoverRefreshCheckpoint: null
+  deleteCoverRefreshCheckpoint: null
+  coverRefreshMarkCompleted: null
+  coverRefreshSaveWork: null
   updateWork: null
   accounts: Account[]
   createAccount: Account

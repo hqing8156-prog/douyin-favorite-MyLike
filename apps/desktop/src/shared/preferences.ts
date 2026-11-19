@@ -112,7 +112,11 @@ export const appPreferencesSchema = z.object({
   motion: z.enum(['system', 'reduce']).default('system'),
   deepseekApiKey: z.string().max(300).default(''),
   siliconFlowApiKey: z.string().max(300).default(''),
-  favoriteCategoryHints: z.string().max(2000).default(''),
+  /**
+   * Frame recognition during AI classification. Each video costs an extra Douyin detail
+   * request and a partial video download, so it can be disabled to reduce platform load.
+   */
+  aiVideoInspection: z.boolean().default(true),
   syncFavoritesToCloud: z.boolean().default(false),
   autoContinueWriteback: z.boolean().default(false),
   writebackBatchIntervalSec: z
@@ -132,7 +136,7 @@ export const appPreferencesPatchSchema = z.object({
   motion: appPreferencesSchema.shape.motion.removeDefault().optional(),
   deepseekApiKey: appPreferencesSchema.shape.deepseekApiKey.removeDefault().optional(),
   siliconFlowApiKey: appPreferencesSchema.shape.siliconFlowApiKey.removeDefault().optional(),
-  favoriteCategoryHints: appPreferencesSchema.shape.favoriteCategoryHints.removeDefault().optional(),
+  aiVideoInspection: appPreferencesSchema.shape.aiVideoInspection.removeDefault().optional(),
   syncFavoritesToCloud: appPreferencesSchema.shape.syncFavoritesToCloud.removeDefault().optional(),
   autoContinueWriteback: appPreferencesSchema.shape.autoContinueWriteback.removeDefault().optional(),
   writebackBatchIntervalSec: appPreferencesSchema.shape.writebackBatchIntervalSec.removeDefault().optional(),

@@ -1,6 +1,6 @@
 import { spawn } from 'node:child_process'
 import { randomUUID } from 'node:crypto'
-import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
+import { mkdir, mkdtemp, open, readFile, readdir, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import type {
@@ -20,6 +20,20 @@ import type { RuntimeEventInput } from '../shared/runtime-events'
 type Run = <T>(accountId: string, action: (check: () => void) => Promise<T>) => Promise<T>
 type Assignment = { workId: string; category: string }
 type WorkAssignment = { workId: string; categories: string[] }
+
+const FRAME_FILTER = 'fps=1/8,scale=512:-1'
+const FRAME_LIMIT = '4'
+const VIDEO_REFERER = 'Referer: https://www.douyin.com/\r\n'
+const VIDEO_USER_AGENT =
+  'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
+/**
+ * Ceiling for the fallback download, which only runs when ffmpeg cannot read the remote
+ * stream. The normal path lets ffmpeg fetch just the part it decodes, so video size is
+ * not a classification constraint.
+ */
+const MAX_VIDEO_DOWNLOAD_BYTES = 512 * 1024 * 1024
+/** Errors that describe the whole run rather than one unreadable video. */
+const FATAL_VIDEO_CODES = ['CANCELLED', 'CLOSING', 'ACCOUNT_CHANGED', 'AI_FFMPEG_REQUIRED']
 
 function normalizeWorkAssignments(value: unknown, workIds: ReadonlySet<string>): WorkAssignment[] {
   if (!value || typeof value !== 'object' || Array.isArray(value)) return []
@@ -128,6 +142,8 @@ const emptyClassification = (): AiClassificationResult => ({
   folderCounts: []
 })
 
+const isLongCaption = (title: string) => [...title.trim()].length > 200
+
 /** Extracts `作品 <id> → <收藏夹>` pairs from a previous classification log. */
 export function parseClassificationLog(text: string): { workId: string; category: string }[] {
   const seen = new Set<string>()
@@ -175,15 +191,38 @@ export function parseFolderNameSuggestions(content: string): string[] {
   return names
 }
 
-const lineNames = (value: string) =>
-  [
-    ...new Set(
-      value
-        .split(/\r?\n/)
-        .map((line) => line.trim())
-        .filter(Boolean)
-    )
-  ].slice(0, 100)
+export function parseVideoDescriptions(
+  content: string,
+  workReferences: ReadonlySet<string>
+): Map<string, string> {
+  const text = content.replace(/<think>[\s\S]*?<\/think>/gi, '').trim()
+  const fenced = text.match(/^```(?:json)?\s*([\s\S]*?)\s*```$/i)?.[1]
+  const candidate = fenced ?? text.match(/\{[\s\S]*\}/)?.[0]
+  if (!candidate) throw new AppError('AI_RESPONSE_INVALID', 'SiliconFlow 没有返回可解析的视频画面描述。')
+  let parsed: unknown
+  try {
+    parsed = JSON.parse(candidate)
+  } catch {
+    throw new AppError('AI_RESPONSE_INVALID', 'SiliconFlow 返回的视频画面描述不是有效 JSON。')
+  }
+  if (
+    !parsed ||
+    typeof parsed !== 'object' ||
+    !Array.isArray((parsed as { descriptions?: unknown }).descriptions)
+  )
+    throw new AppError('AI_RESPONSE_INVALID', 'SiliconFlow 返回的视频画面描述格式无效。')
+  const descriptions = new Map<string, string>()
+  for (const entry of (parsed as { descriptions: unknown[] }).descriptions) {
+    if (!entry || typeof entry !== 'object') continue
+    const value = entry as { workId?: unknown; description?: unknown }
+    if (typeof value.workId !== 'string' || !workReferences.has(value.workId)) continue
+    if (typeof value.description !== 'string' || !value.description.trim()) continue
+    descriptions.set(value.workId, value.description.trim().slice(0, 1000))
+  }
+  if (descriptions.size !== workReferences.size)
+    throw new AppError('AI_RESPONSE_INVALID', 'SiliconFlow 未能为全部视频返回画面描述，请重试。')
+  return descriptions
+}
 
 const fetchAi = async (url: string, init: RequestInit): Promise<Response> => {
   try {
@@ -217,16 +256,7 @@ const requestJson = async (
   provider: 'DeepSeek' | 'SiliconFlow' = 'DeepSeek'
 ): Promise<any> => {
   const response = await fetchAi(url, init)
-  if ([401, 403].includes(response.status))
-    throw new AppError(
-      'AI_AUTH_REJECTED',
-      `${provider} 拒绝了 API Key（HTTP ${response.status}）。请确认使用该平台签发的有效 Key，且账户可用。`
-    )
-  if (!response.ok)
-    throw new AppError(
-      'AI_API_REJECTED',
-      `${provider} 请求失败（HTTP ${response.status}），请检查账户额度或服务状态。`
-    )
+  if (!response.ok) await rejectProviderResponse(response, provider, init.headers)
   const body = await response.text()
   let data: any
   try {
@@ -235,6 +265,52 @@ const requestJson = async (
     throw new AppError('AI_API_REJECTED', `AI 服务返回了无法解析的内容（HTTP ${response.status}）。`)
   }
   return data
+}
+
+const extractProviderError = (body: string, headers?: HeadersInit): string | undefined => {
+  let data: unknown
+  try {
+    data = JSON.parse(body)
+  } catch {
+    return undefined
+  }
+  if (typeof data !== 'object' || data === null) return undefined
+  const record = data as Record<string, unknown>
+  const error = typeof record.error === 'object' && record.error !== null ? record.error : undefined
+  const message = (error && 'message' in error && error.message) || record.message || record.detail
+  if (typeof message !== 'string') return undefined
+  const authorization = new Headers(headers).get('Authorization')
+  const apiKey = authorization?.replace(/^Bearer\s+/i, '')
+  const safeMessage = apiKey ? message.replaceAll(apiKey, '[已隐藏]') : message
+  const detail = safeMessage
+    .replace(/[\u0000-\u001f\u007f]+/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim()
+    .slice(0, 240)
+  return detail || undefined
+}
+
+const rejectProviderResponse = async (
+  response: Response,
+  provider: 'DeepSeek' | 'SiliconFlow',
+  headers?: HeadersInit
+): Promise<never> => {
+  const body = await response.text()
+  const detail = extractProviderError(body, headers)
+  if (response.status === 401)
+    throw new AppError(
+      'AI_AUTH_REJECTED',
+      `${provider} 拒绝了 API Key（HTTP 401）。请确认使用该平台签发的有效 Key，且账户可用。`
+    )
+  if (response.status === 403)
+    throw new AppError(
+      'AI_ACCESS_REJECTED',
+      `${provider} 拒绝了当前请求（HTTP 403）。请检查账户状态、模型调用权限或额度。${detail ? ` 服务说明：${detail}` : ''}`
+    )
+  throw new AppError(
+    'AI_API_REJECTED',
+    `${provider} 请求失败（HTTP ${response.status}），请检查账户额度或服务状态。${detail ? ` 服务说明：${detail}` : ''}`
+  )
 }
 
 const missingApiKey = (provider: 'deepseek' | 'siliconflow') =>
@@ -246,13 +322,23 @@ const missingApiKey = (provider: 'deepseek' | 'siliconflow') =>
 export class AiClassifier {
   constructor(
     private readonly db: Pick<Database, 'call'>,
-    private readonly engine: Pick<DouyinEngine, 'request'>,
+    engine: Pick<DouyinEngine, 'request'>,
     private readonly run: Run,
     private readonly identity: (accountId: string, check: () => void) => Promise<Account>,
     private readonly changed: () => void,
     private readonly report: (accountId: string, event: RuntimeEventInput) => void = () => {},
     private readonly onProgress: (progress: AiClassificationProgress) => void = () => {},
-    private readonly log: (line: string) => void = () => {}
+    private readonly log: (line: string) => void = () => {},
+    private readonly runClassificationInBackground: Run = run,
+    private readonly classificationRequest: Pick<DouyinEngine, 'request'>['request'] = (
+      accountId,
+      operation,
+      parameters
+    ) => engine.request(accountId, operation, parameters),
+    private readonly classificationIdentity: (
+      accountId: string,
+      check: () => void
+    ) => Promise<Account> = identity
   ) {}
 
   async testConnection(provider: 'deepseek' | 'siliconflow'): Promise<null> {
@@ -263,16 +349,10 @@ export class AiClassifier {
       provider === 'deepseek' ? 'https://api.deepseek.com/models' : 'https://api.siliconflow.cn/v1/models',
       { headers: { Authorization: `Bearer ${apiKey}` } }
     )
-    if ([401, 403].includes(response.status))
-      throw new AppError(
-        'AI_AUTH_REJECTED',
-        `${provider === 'deepseek' ? 'DeepSeek' : 'SiliconFlow'} 拒绝了 API Key（HTTP ${response.status}）。请确认使用该平台签发的有效 Key，且账户可用。`
-      )
     if (!response.ok)
-      throw new AppError(
-        'AI_API_REJECTED',
-        `${provider === 'deepseek' ? 'DeepSeek' : 'SiliconFlow'} 测试请求失败（HTTP ${response.status}），请检查账户状态或服务状态。`
-      )
+      await rejectProviderResponse(response, provider === 'deepseek' ? 'DeepSeek' : 'SiliconFlow', {
+        Authorization: `Bearer ${apiKey}`
+      })
     return null
   }
 
@@ -309,7 +389,6 @@ export class AiClassifier {
             {
               role: 'user',
               content: `${JSON.stringify({
-                preferredCategories: lineNames(preferences.favoriteCategoryHints),
                 works: works.slice(0, 80).map(({ title, author }) => ({ title, author }))
               })}\n输出格式：{"folders":["名称1","名称2"]}。不要加 AI- 前缀，每个名称不超过 27 个字符。`
             }
@@ -354,13 +433,9 @@ export class AiClassifier {
     }
     updateProgress({})
     try {
-      const result = await this.run(accountId, async (check) => {
+      const result = await this.runClassificationInBackground(accountId, async (check) => {
         phase = '读取设置'
         const preferences = (await this.db.call('appPreferences', {})) as AppPreferences
-        if (!preferences.deepseekApiKey) throw missingApiKey('deepseek')
-        phase = '核验抖音身份'
-        const account = await this.identity(accountId, check)
-        if (!account.remoteId) throw new AppError('AUTH_REQUIRED', '请先登录并核验抖音账号。')
         phase = '读取本地收藏'
         const source = options.source ?? 'favorites'
         let works = await this.works(accountId, source, check)
@@ -370,6 +445,11 @@ export class AiClassifier {
           )
           works = works.filter((work) => unclassified.has(work.id))
         }
+        const literaryWorks = works.filter((work) => isLongCaption(work.title))
+        if (!preferences.deepseekApiKey && !literaryWorks.length) throw missingApiKey('deepseek')
+        phase = '核验抖音身份'
+        const account = await this.classificationIdentity(accountId, check)
+        if (!account.remoteId) throw new AppError('AUTH_REQUIRED', '请先登录并核验抖音账号。')
         console.info(`[AI] ${source === 'likes' ? '喜欢添加' : '收藏分类'}开始：读取 ${works.length} 条。`)
         this.log(
           `\n===== ${new Date().toISOString()} ${source === 'likes' ? '喜欢添加' : '收藏分类'}：${works.length} 条 =====`
@@ -386,6 +466,7 @@ export class AiClassifier {
             folderCounts: []
           }
         }
+        const aiWorks = works.filter((work) => !isLongCaption(work.title))
         const aiFolderNames: string[] = []
         if (options.createAiFolders) {
           const seenNames = new Set<string>()
@@ -404,10 +485,10 @@ export class AiClassifier {
             }
           }
         }
-        if (!options.folderIds.length && !aiFolderNames.length)
+        if (!options.folderIds.length && !aiFolderNames.length && !literaryWorks.length)
           throw new AppError(
             'AI_RESPONSE_INVALID',
-            '请至少选择一个已存在的收藏夹，或勾选创建并输入 AI 收藏夹名称。'
+            '没有超过200字的文案可自动归档，请至少选择一个已有收藏夹或创建 AI 收藏夹。'
           )
         phase = '读取抖音收藏夹'
         const folders = await this.remoteFolders(accountId, check)
@@ -423,19 +504,28 @@ export class AiClassifier {
             selectedFolders.push(existing)
         }
         const pendingAiFolders = aiFolderNames.filter((name) => !foldersByName.has(name.toLocaleLowerCase()))
-        phase = '调用 AI 分类'
-        updateProgress({ phase: '正在分析作品', total: works.length, current: 0 })
-        const assignments = await this.classify(
-          works,
-          preferences,
-          accountId,
-          check,
-          selectedFolders,
-          pendingAiFolders,
-          (phase, current, total) => updateProgress({ phase, current, total })
-        )
-        console.info(`[AI] DeepSeek 返回 ${assignments.length} 条分类结果。`)
-        // Persist the AI output before applying it. If the app is closed or a
+        const literatureFolder = foldersByName.get('文学')
+        const literatureCategory = literatureFolder?.title ?? '文学'
+        const assignments: Assignment[] = []
+        if (aiWorks.length && (selectedFolders.length || pendingAiFolders.length)) {
+          if (!preferences.deepseekApiKey) throw missingApiKey('deepseek')
+          phase = '调用 AI 分类'
+          updateProgress({ phase: '正在分析作品', total: aiWorks.length, current: 0 })
+          assignments.push(
+            ...(await this.classify(
+              aiWorks,
+              preferences,
+              accountId,
+              check,
+              selectedFolders,
+              pendingAiFolders,
+              (phase, current, total) => updateProgress({ phase, current, total })
+            ))
+          )
+        }
+        assignments.push(...literaryWorks.map((work) => ({ workId: work.id, category: literatureCategory })))
+        console.info(`[分类] 生成 ${assignments.length} 条分类结果。`)
+        // Persist the classification output before applying it. If the app is closed or a
         // local write fails, the same result can be re-applied later without
         // calling the AI again. Each new run supersedes the previous one.
         await this.db.call('aiAssignmentClear', { accountId, source })
@@ -471,6 +561,8 @@ export class AiClassifier {
         for (const folder of selectedFolders)
           allowedCategories.set(folder.title.toLocaleLowerCase(), folder.title)
         for (const name of pendingAiFolders) allowedCategories.set(name.toLocaleLowerCase(), name)
+        if (literaryWorks.length)
+          allowedCategories.set(literatureCategory.toLocaleLowerCase(), literatureCategory)
         const grouped = new Map<string, string[]>()
         for (const assignment of assignments) {
           const category = allowedCategories.get(assignment.category.toLocaleLowerCase())
@@ -483,17 +575,36 @@ export class AiClassifier {
           ids.push(assignment.workId)
           grouped.set(category, ids)
         }
-        if (unmatched === 0 && allowedCategories.size > 1 && grouped.size === 1) {
-          const [category, ids] = [...grouped][0]!
+        const aiWorkIds = new Set(aiWorks.map((work) => work.id))
+        const aiAssignedWorkIds = new Set<string>()
+        const aiCategories = new Set<string>()
+        for (const assignment of assignments) {
+          if (!aiWorkIds.has(assignment.workId)) continue
+          aiAssignedWorkIds.add(assignment.workId)
+          aiCategories.add(assignment.category.toLocaleLowerCase())
+        }
+        const aiUnmatched = aiWorks.length - aiAssignedWorkIds.size
+        if (
+          aiUnmatched === 0 &&
+          selectedFolders.length + pendingAiFolders.length > 1 &&
+          aiCategories.size === 1
+        ) {
+          const category = [...aiCategories][0]!
+          const ids = assignments
+            .filter((assignment) => assignment.category.toLocaleLowerCase() === category)
+            .map((assignment) => assignment.workId)
           throw new AppError(
             'AI_RESPONSE_INVALID',
-            `AI 将 ${ids.length} 条作品全部分配到“${category}”，但本次选择了 ${allowedCategories.size} 个收藏夹。为避免错误写入，未创建收藏夹且未写入任何作品；请检查分类名称或重新选择收藏夹。`
+            `AI 将 ${ids.length} 条作品全部分配到“${category}”，但本次选择了 ${selectedFolders.length + pendingAiFolders.length} 个收藏夹。为避免错误写入，未创建收藏夹且未写入任何作品；请检查分类名称或重新选择收藏夹。`
           )
         }
         const folderMap = new Map(folders.map((folder) => [folder.title, folder]))
         let foldersCreated = 0
-        for (const name of pendingAiFolders.filter((name) => grouped.has(name))) {
-          phase = '创建 AI 收藏夹'
+        const foldersToCreate = pendingAiFolders.filter((name) => grouped.has(name))
+        if (literaryWorks.length && !literatureFolder && grouped.has(literatureCategory))
+          foldersToCreate.push(literatureCategory)
+        for (const name of foldersToCreate) {
+          phase = name === literatureCategory ? '创建文学收藏夹' : '创建 AI 收藏夹'
           const folder = await this.db.call('favoriteLocalFolderCreate', {
             accountId,
             remoteId: account.remoteId,
@@ -505,7 +616,7 @@ export class AiClassifier {
           folderMap.set(folder.title, folder)
           folderMap.set(name, folder)
           foldersCreated++
-          console.info(`[AI] 已在本地创建收藏夹：${folder.title}`)
+          console.info(`[分类] 已在本地创建收藏夹：${folder.title}`)
         }
         const writeGroups = [...grouped].map(([category, ids]) => {
           const folder = folderMap.get(category)
@@ -606,7 +717,7 @@ export class AiClassifier {
       })
       const diagnostic =
         error instanceof AppError &&
-        ['AI_NETWORK_ERROR', 'AI_API_REJECTED', 'AI_AUTH_REJECTED'].includes(error.code)
+        ['AI_NETWORK_ERROR', 'AI_API_REJECTED', 'AI_AUTH_REJECTED', 'AI_ACCESS_REJECTED'].includes(error.code)
           ? error.message.match(/(?:诊断代码：([A-Z0-9_]{1,40})|HTTP (\d{3}))/)
           : null
       const diagnosticHint = diagnostic?.[1]
@@ -614,12 +725,14 @@ export class AiClassifier {
         : diagnostic?.[2]
           ? ` AI 服务 HTTP 状态：${diagnostic[2]}。`
           : ''
+      const providerDetail =
+        error instanceof AppError && error.code === 'AI_ACCESS_REJECTED' ? ` 服务反馈：${error.message}` : ''
       this.report(accountId, {
         kind: 'task',
         operation: 'aiClassify',
         code: detail.code,
         rule: error instanceof AppError ? error.rule : undefined,
-        message: `AI 自动分类在“${phase}”阶段失败。${diagnosticHint}`
+        message: `AI 自动分类在“${phase}”阶段失败。${diagnosticHint}${providerDetail}`
       })
       throw error
     }
@@ -655,7 +768,7 @@ export class AiClassifier {
     for (let page = 0; page < 100; page++) {
       check()
       const parsed = parseFavoriteFolders(
-        await this.engine.request(accountId, 'folders', { cursor, count: '18' })
+        await this.classificationRequest(accountId, 'folders', { cursor, count: '18' })
       )
       for (const folder of parsed.folders) {
         const known = localByRemoteId.get(folder.id)
@@ -683,7 +796,7 @@ export class AiClassifier {
     if (work.coverUrl || this.thumbnailBlocked) return work
     try {
       check()
-      const response = await this.engine.request(accountId, 'detail', { aweme_id: work.id })
+      const response = await this.classificationRequest(accountId, 'detail', { aweme_id: work.id })
       const refreshed = parseWork(response.aweme_detail)
       check()
       if (refreshed.id === work.id && refreshed.coverUrl) return { ...work, coverUrl: refreshed.coverUrl }
@@ -865,7 +978,13 @@ export class AiClassifier {
       }
       return assignments
     }
-    const input: { id: string; title: string; author: string; transcript?: string }[] = []
+    const input: {
+      id: string
+      title: string
+      author: string
+      videoDescription?: string
+      transcript?: string
+    }[] = []
     const workIdsByReference = new Map<string, string>()
     for (const [index, work] of works.entries()) {
       check()
@@ -879,20 +998,31 @@ export class AiClassifier {
       input.push(entry)
       onProgress('正在准备作品', offset + input.length, overallTotal)
     }
+    if (preferences.siliconFlowApiKey && preferences.aiVideoInspection) {
+      const videoDescriptions = await this.inspectVideos(
+        accountId,
+        works,
+        preferences.siliconFlowApiKey,
+        check,
+        onProgress,
+        offset,
+        overallTotal
+      )
+      for (const entry of input) {
+        const description = videoDescriptions.get(workIdsByReference.get(entry.id) ?? '')
+        if (description) entry.videoDescription = description
+      }
+    }
     onProgress('等待 AI 返回', offset, overallTotal)
-    const preferred = lineNames(preferences.favoriteCategoryHints)
     const allowedFolders = [...targetFolders.map((folder) => folder.title), ...pendingAiFolders]
     const folderReferences = allowedFolders.map((title, index) => ({ id: `F${index + 1}`, title }))
     const folderTitlesByReference = new Map(folderReferences.map((folder) => [folder.id, folder.title]))
     const folderTitlesByName = new Map(allowedFolders.map((title) => [title.toLocaleLowerCase(), title]))
     const system =
-      '你是谨慎的抖音收藏整理助手。只根据作品标题、作者和提供的作品信息，与收藏夹名称做严格的主题匹配。只输出 JSON，不要输出 Markdown 或解释。'
+      '你是谨慎的抖音收藏整理助手。只根据作品标题、作者、视频画面描述、语音转写和提供的作品信息，与收藏夹名称做严格的主题匹配。只输出 JSON，不要输出 Markdown 或解释。'
     const user = JSON.stringify({
       targetFolders: folderReferences,
-      preferredCategories: preferred.filter((name) =>
-        allowedFolders.some((folder) => folder.toLocaleLowerCase() === name.toLocaleLowerCase())
-      ),
-      rule: 'works 中每个作品都必须返回一个 assignment。逐条判断作品本身的主题是否明确符合收藏夹名称；只有标题、作者或提供的作品信息有直接且充分的证据时才归类。不能仅因属于相邻领域、同一大类、作者相同或可能相关就归类；信息不足或只是宽泛关联时，categories 必须返回空数组。例：收藏夹名为“游泳”时，羽毛球、篮球、乒乓球、一般健身或其他运动作品都不匹配，除非作品本身明确涉及游泳。不要为了填满收藏夹而降低标准。不同作品应独立判断，不要为了省事把所有作品都放进同一个收藏夹；只有当每条作品都确实符合该收藏夹时，才可全部选择同一个收藏夹。workId 必须原样复制 works[].id 的字符串，categories 必须从 targetFolders[].id 中选择零个或多个值；不要输出收藏夹名称或改写引用。',
+      rule: 'works 中每个作品都必须返回一个 assignment。逐条判断作品本身的主题是否明确符合收藏夹名称；只有标题、作者、视频画面描述、语音转写或提供的作品信息有直接且充分的证据时才归类。不能仅因属于相邻领域、同一大类、作者相同或可能相关就归类；信息不足或只是宽泛关联时，categories 必须返回空数组。例：收藏夹名为“游泳”时，羽毛球、篮球、乒乓球、一般健身或其他运动作品都不匹配，除非作品本身明确涉及游泳。不要为了填满收藏夹而降低标准。不同作品应独立判断，不要为了省事把所有作品都放进同一个收藏夹；只有当每条作品都确实符合该收藏夹时，才可全部选择同一个收藏夹。workId 必须原样复制 works[].id 的字符串，categories 必须从 targetFolders[].id 中选择零个或多个值；不要输出收藏夹名称或改写引用。',
       works: input
     })
     try {
@@ -976,6 +1106,224 @@ export class AiClassifier {
     }
   }
 
+  private async inspectVideos(
+    accountId: string,
+    works: Work[],
+    apiKey: string,
+    check: () => void,
+    onProgress: (phase: string, current: number, total: number) => void,
+    offset: number,
+    overallTotal: number
+  ): Promise<Map<string, string>> {
+    const videos = works
+      .map((work, index) => ({ work, reference: `W${index + 1}` }))
+      .filter(({ work }) => work.mediaType === 'video')
+    const descriptions = new Map<string, string>()
+    let skipped = 0
+    for (let batchOffset = 0; batchOffset < videos.length; batchOffset += 4) {
+      check()
+      const batch = videos.slice(batchOffset, batchOffset + 4)
+      const framesByReference = new Map<string, Buffer[]>()
+      for (const { work, reference } of batch) {
+        onProgress('正在读取视频画面', offset + works.length, overallTotal)
+        try {
+          framesByReference.set(reference, await this.extractVideoFrames(accountId, work.id, check))
+        } catch (error) {
+          // One unreadable video must not fail the whole run: it still gets classified
+          // from its title and author. Only run-wide problems abort the classification.
+          if (error instanceof AppError && FATAL_VIDEO_CODES.includes(error.code)) throw error
+          skipped++
+          const reason = error instanceof Error ? error.message : String(error)
+          console.warn(`[AI] 跳过视频画面：作品 ${work.id}：${reason}`)
+          this.log(`[AI] 跳过视频画面：作品 ${work.id}：${reason}`)
+        }
+      }
+      if (!framesByReference.size) continue
+      const content: ({ type: 'text'; text: string } | { type: 'image_url'; image_url: { url: string } })[] =
+        [
+          {
+            type: 'text',
+            text: `请根据每个抖音视频的关键帧，分别描述画面中实际出现的主体、活动和场景，忽略无法确认的细节。每组图片前都有作品引用，必须为每个引用返回一条简短中文描述。只返回 JSON：{"descriptions":[{"workId":"W1","description":"..."}]}`
+          }
+        ]
+      for (const [reference, frames] of framesByReference) {
+        for (const [index, frame] of frames.entries()) {
+          content.push({ type: 'text', text: `作品 ${reference} 的关键帧 ${index + 1}` })
+          content.push({
+            type: 'image_url',
+            image_url: { url: `data:image/jpeg;base64,${frame.toString('base64')}` }
+          })
+        }
+      }
+      onProgress('正在识别视频画面', offset + works.length, overallTotal)
+      const data = await requestJson(
+        'https://api.siliconflow.cn/v1/chat/completions',
+        {
+          method: 'POST',
+          headers: {
+            Authorization: `Bearer ${apiKey}`,
+            'Content-Type': 'application/json'
+          },
+          body: JSON.stringify({
+            model: 'Qwen/Qwen3-VL-8B-Instruct',
+            temperature: 0.1,
+            messages: [{ role: 'user', content }]
+          })
+        },
+        'SiliconFlow'
+      )
+      check()
+      const response = data.choices?.[0]?.message?.content
+      if (typeof response !== 'string' || !response.trim())
+        throw new AppError('AI_RESPONSE_INVALID', 'SiliconFlow 没有返回可用的视频画面描述。')
+      const batchDescriptions = parseVideoDescriptions(response, new Set(framesByReference.keys()))
+      for (const [reference, description] of batchDescriptions) {
+        const work = batch.find((item) => item.reference === reference)?.work
+        if (work) descriptions.set(work.id, description)
+      }
+    }
+    if (skipped) this.log(`[AI] 有 ${skipped} 个视频无法读取画面，已按标题和作者继续分类。`)
+    return descriptions
+  }
+
+  /**
+   * Extracts keyframes for the vision model. ffmpeg reads the remote stream directly, so
+   * only the part it actually decodes is transferred: a long or heavy video is neither
+   * buffered in memory nor rejected for its size. If the remote read fails, the video is
+   * downloaded to disk and retried locally.
+   */
+  private async extractVideoFrames(accountId: string, workId: string, check: () => void): Promise<Buffer[]> {
+    const directory = await mkdtemp(join(tmpdir(), 'mylike-ai-video-'))
+    try {
+      const media = parseMedia(
+        await this.classificationRequest(accountId, 'detail', {
+          aweme_id: workId,
+          publish_video_strategy_type: '2',
+          pc_client_type: '1'
+        })
+      )
+      const url = media.videos[0]
+      if (!url) throw new AppError('AI_VIDEO_READ_FAILED', '抖音没有提供可读取的视频地址。')
+      check()
+      const remoteDirectory = join(directory, 'remote')
+      await mkdir(remoteDirectory)
+      try {
+        return await this.runFrameExtraction(
+          ['-rw_timeout', '20000000', '-user_agent', VIDEO_USER_AGENT, '-headers', VIDEO_REFERER, '-i', url],
+          remoteDirectory
+        )
+      } catch (error) {
+        if (error instanceof AppError && error.code === 'AI_FFMPEG_REQUIRED') throw error
+        check()
+        const reason = error instanceof Error ? error.message : String(error)
+        this.log(`[AI] 直接读取视频流失败，改为下载后重试：作品 ${workId}：${reason}`)
+      }
+      const input = join(directory, 'source.mp4')
+      await this.downloadVideo(url, input)
+      check()
+      const localDirectory = join(directory, 'local')
+      await mkdir(localDirectory)
+      return await this.runFrameExtraction(['-i', input], localDirectory)
+    } finally {
+      await rm(directory, { recursive: true, force: true })
+    }
+  }
+
+  private async runFrameExtraction(inputArgs: string[], outputDirectory: string): Promise<Buffer[]> {
+    await this.runFfmpeg([
+      '-hide_banner',
+      '-loglevel',
+      'error',
+      '-y',
+      ...inputArgs,
+      '-vf',
+      FRAME_FILTER,
+      '-frames:v',
+      FRAME_LIMIT,
+      '-q:v',
+      '5',
+      join(outputDirectory, 'frame-%02d.jpg')
+    ])
+    const frameFiles = (await readdir(outputDirectory)).filter((name) => /^frame-\d+\.jpg$/.test(name)).sort()
+    if (!frameFiles.length) throw new AppError('AI_VIDEO_FRAME_EXTRACTION_FAILED', '视频中没有可识别的画面。')
+    return await Promise.all(frameFiles.map((name) => readFile(join(outputDirectory, name))))
+  }
+
+  private runFfmpeg(args: string[], timeoutMs = 180_000): Promise<void> {
+    return new Promise<void>((resolve, reject) => {
+      const process = spawn('ffmpeg', args, { windowsHide: true })
+      const timedOut = new AppError('AI_VIDEO_FRAME_EXTRACTION_FAILED', '读取视频画面超时，已跳过该视频。')
+      let killed = false
+      let settled = false
+      const finish = (error?: Error) => {
+        if (settled) return
+        settled = true
+        clearTimeout(timer)
+        clearTimeout(backstop)
+        if (error) reject(error)
+        else resolve()
+      }
+      const timer = setTimeout(() => {
+        killed = true
+        process.kill()
+      }, timeoutMs)
+      // Do not wait forever if the child ignores the kill; the caller needs its temp
+      // directory removed so the next video can proceed.
+      const backstop = setTimeout(() => finish(timedOut), 5_000)
+      process.on('error', () =>
+        finish(
+          new AppError('AI_FFMPEG_REQUIRED', '视频画面识别需要在电脑上安装 FFmpeg，并确保 ffmpeg 命令可用。')
+        )
+      )
+      process.on('close', (code) =>
+        finish(
+          killed
+            ? timedOut
+            : code === 0
+              ? undefined
+              : new AppError('AI_VIDEO_FRAME_EXTRACTION_FAILED', '无法从视频中提取关键帧。')
+        )
+      )
+    })
+  }
+
+  /** Fallback path: streams the video to disk instead of holding it all in memory. */
+  private async downloadVideo(url: string, target: string): Promise<void> {
+    let response: Response
+    try {
+      response = await fetch(url, {
+        headers: { Referer: 'https://www.douyin.com/' },
+        signal: AbortSignal.timeout(300_000)
+      })
+    } catch {
+      throw new AppError('AI_VIDEO_READ_FAILED', '无法下载抖音视频，请检查网络或稍后重试。')
+    }
+    if (!response.ok)
+      throw new AppError('AI_VIDEO_READ_FAILED', `下载抖音视频失败（HTTP ${response.status}）。`)
+    const limitMb = MAX_VIDEO_DOWNLOAD_BYTES / 1024 / 1024
+    const contentLength = Number(response.headers.get('content-length'))
+    if (Number.isFinite(contentLength) && contentLength > MAX_VIDEO_DOWNLOAD_BYTES)
+      throw new AppError('AI_VIDEO_TOO_LARGE', `视频文件超过 ${limitMb} MB，已跳过画面识别。`)
+    const reader = response.body?.getReader()
+    if (!reader) throw new AppError('AI_VIDEO_READ_FAILED', '无法读取抖音视频数据。')
+    const file = await open(target, 'w')
+    let size = 0
+    try {
+      while (true) {
+        const { done, value } = await reader.read()
+        if (done) break
+        size += value.byteLength
+        if (size > MAX_VIDEO_DOWNLOAD_BYTES) {
+          await reader.cancel()
+          throw new AppError('AI_VIDEO_TOO_LARGE', `视频文件超过 ${limitMb} MB，已跳过画面识别。`)
+        }
+        await file.write(Buffer.from(value))
+      }
+    } finally {
+      await file.close()
+    }
+  }
+
   private async transcribe(
     accountId: string,
     workId: string,
@@ -987,7 +1335,7 @@ export class AiClassifier {
     const audio = join(directory, 'audio.mp3')
     try {
       const media = parseMedia(
-        await this.engine.request(accountId, 'detail', {
+        await this.classificationRequest(accountId, 'detail', {
           aweme_id: workId,
           publish_video_strategy_type: '2',
           pc_client_type: '1'

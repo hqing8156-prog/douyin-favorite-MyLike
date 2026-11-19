@@ -38,11 +38,17 @@
   box-shadow: var(--shadow);
   font-size: 12px;
 }
+.select-option-row {
+  position: relative;
+  display: flex;
+  align-items: stretch;
+}
 .select-option {
   display: flex;
+  flex: 1;
   align-items: center;
   justify-content: space-between;
-  gap: 14px;
+  min-width: 0;
   min-height: 36px;
   padding: 8px 10px;
   border-radius: 6px;
@@ -53,6 +59,70 @@
   text-overflow: ellipsis;
   white-space: nowrap;
 }
+.select-option-label {
+  display: flex;
+  flex: 1;
+  min-width: 0;
+  align-items: center;
+  gap: 5px;
+}
+.select-option-folder-title {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.select-option-folder-count {
+  flex: 0 0 auto;
+  white-space: nowrap;
+}
+.select-option-status {
+  display: inline-flex;
+  flex: 0 0 auto;
+  align-items: center;
+  color: var(--muted);
+  opacity: 0.72;
+}
+.select-option-status span {
+  display: inline-flex;
+}
+.select-option-actions {
+  position: absolute;
+  top: 5px;
+  right: 5px;
+  display: flex;
+  align-items: center;
+  gap: 2px;
+  padding: 1px;
+  border-radius: 6px;
+  background: var(--surface2);
+  opacity: 0;
+  pointer-events: none;
+}
+.select-option-row:hover .select-option-actions,
+.select-option-row:focus-within .select-option-actions {
+  opacity: 1;
+  pointer-events: auto;
+}
+.select-option-actions button {
+  display: grid;
+  width: 26px;
+  height: 26px;
+  place-items: center;
+  padding: 0;
+  border: 0;
+  border-radius: 5px;
+  color: var(--muted);
+  background: transparent;
+  cursor: pointer;
+}
+.select-option-actions button:hover:not(:disabled) {
+  color: var(--text);
+  background: var(--surface);
+}
+.select-option-actions button.danger-button:hover:not(:disabled) {
+  color: #e77979;
+}
 .select-option.is-active {
   background: var(--surface2);
 }
@@ -62,4 +132,52 @@
 .select-option[aria-disabled='true'] {
   opacity: 0.35;
   cursor: not-allowed;
+}
+.video-duration-trigger {
+  min-width: 126px;
+}
+.video-duration-popup {
+  padding: 10px 12px;
+  overflow: visible;
+}
+.video-duration-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-height: 34px;
+  white-space: nowrap;
+}
+.video-duration-checkbox {
+  appearance: none;
+  position: relative;
+  flex: 0 0 auto;
+  width: 15px;
+  height: 15px;
+  margin: 0;
+  padding: 0;
+  border: 1px solid var(--muted);
+  border-radius: 50%;
+  background: transparent;
+  cursor: pointer;
+}
+.video-duration-checkbox:checked {
+  border-color: var(--accent);
+}
+.video-duration-checkbox:checked::after {
+  position: absolute;
+  inset: 3px;
+  border-radius: 50%;
+  background: var(--accent);
+  content: '';
+}
+.video-duration-input {
+  width: 78px;
+  height: 32px;
+  padding: 5px 8px;
+  font-size: 12px;
+}
+.video-duration-error {
+  display: block;
+  margin: 6px 0 0 23px;
+  color: #e77979;
 }

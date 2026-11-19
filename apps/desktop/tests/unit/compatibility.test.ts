@@ -102,12 +102,18 @@ afterEach(() => {
   }
 })
 
-it('keeps the v8 core columns and uses only legacy task statuses even for partial completion', () => {
+it('keeps the core layout and uses only legacy task statuses even for partial completion', () => {
   const { store, file } = setup()
   const task = save(store, folder(store), [work('1')], false, '0', true)
   expect(task.status).toBe('partial')
   inspect(file, (db) => {
-    expect(db.prepare('PRAGMA user_version').get()?.user_version).toBe(8)
+    expect(db.prepare('PRAGMA user_version').get()?.user_version).toBe(17)
+    expect(
+      db
+        .prepare('PRAGMA table_info(works)')
+        .all()
+        .map((row) => row.name)
+    ).toContain('durationMs')
     expect(
       db
         .prepare('PRAGMA table_info(saved_tasks)')

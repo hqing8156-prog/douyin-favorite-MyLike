@@ -1,3 +1,4 @@
+import { useLayoutEffect, useRef, type UIEvent } from 'react'
 import {
   ArrowRight,
   Film,
@@ -9,7 +10,9 @@ import {
   Shuffle,
   CalendarDays,
   TrendingUp,
-  FileText
+  FileText,
+  UsersRound,
+  RefreshCw
 } from 'lucide-react'
 import type { Account, LibraryOverview, Snapshot, Work } from '../../shared/contracts'
 import './dashboard.css'
@@ -20,18 +23,81 @@ import { BrandMark } from './BrandMark'
 type Props = {
   account: Account | undefined
   snapshot: Snapshot | null
-  overview: { data: LibraryOverview | null; error: string; retry: () => void }
+  overview: { data: LibraryOverview | null; error: string; loading: boolean; retry: () => void }
   busy: boolean
   browse: () => void
   add: () => void
   play: (work?: Work) => void
   resume: () => void
+  searchAuthor: (author: string) => void
 }
 const number = (value: number | undefined) => (value === undefined ? '—' : value.toLocaleString('zh-CN'))
 
-export function Dashboard({ account, snapshot, overview, busy, browse, add, play, resume }: Props) {
+/**
+ * 仪表盘在切换 tab 时会整体卸载，组件内的 ref 留不住滚动位置，
+ * 所以把位置记在模块级。作者列表按“第一条可见作者”锚定，
+ * 回来后即使后台重新统计改变了行高或顺序，也能落回原来那几条。
+ */
+const scrollMemory = {
+  page: 0,
+  authors: 0,
+  anchor: null as string | null,
+  anchorDelta: 0
+}
+
+export function Dashboard({
+  account,
+  snapshot,
+  overview,
+  busy,
+  browse,
+  add,
+  play,
+  resume,
+  searchAuthor
+}: Props) {
   const data = overview.data
   const playback = snapshot?.playback && !snapshot.playback.completed ? snapshot.playback : null
+  const pageRef = useRef<HTMLDivElement>(null)
+  const authorsRef = useRef<HTMLDivElement>(null)
+  const authorsRestored = useRef(false)
+
+  useLayoutEffect(() => {
+    if (pageRef.current) pageRef.current.scrollTop = scrollMemory.page
+  }, [])
+
+  useLayoutEffect(() => {
+    const list = authorsRef.current
+    if (authorsRestored.current || !list || !list.childElementCount) return
+    authorsRestored.current = true
+    if (scrollMemory.anchor) {
+      const row = Array.from(list.children).find(
+        (child) => (child as HTMLElement).dataset.authorId === scrollMemory.anchor
+      ) as HTMLElement | undefined
+      if (row) {
+        list.scrollTop = row.offsetTop + scrollMemory.anchorDelta
+        return
+      }
+    }
+    list.scrollTop = scrollMemory.authors
+  }, [data])
+
+  const rememberPage = (event: UIEvent<HTMLDivElement>) => {
+    scrollMemory.page = event.currentTarget.scrollTop
+  }
+
+  const rememberAuthors = (event: UIEvent<HTMLDivElement>) => {
+    const node = event.currentTarget
+    scrollMemory.authors = node.scrollTop
+    let anchor: HTMLElement | undefined
+    for (const child of Array.from(node.children) as HTMLElement[]) {
+      if (child.offsetTop > node.scrollTop + 1) break
+      anchor = child
+    }
+    scrollMemory.anchor = anchor?.dataset.authorId ?? null
+    scrollMemory.anchorDelta = anchor ? node.scrollTop - anchor.offsetTop : 0
+  }
+
   if (!account)
     return (
       <div className="dashboard-scroll">
@@ -49,7 +115,13 @@ export function Dashboard({ account, snapshot, overview, busy, browse, add, play
       </div>
     )
   return (
-    <div className="dashboard-scroll" role="region" aria-label="仪表盘内容">
+    <div
+      className="dashboard-scroll"
+      role="region"
+      aria-label="仪表盘内容"
+      ref={pageRef}
+      onScroll={rememberPage}
+    >
       <section className="dashboard-hero">
         <div>
           <span className="dashboard-eyebrow">YOUR PERSONAL COLLECTION</span>
@@ -191,6 +263,59 @@ export function Dashboard({ account, snapshot, overview, busy, browse, add, play
           )}
         </section>
       </div>
+      <section className="dashboard-authors" aria-label="喜欢作者作品数">
+        <div className="dashboard-section-title">
+          <UsersRound size={16} />
+          <h2>喜欢作者</h2>
+          <span>按作者 ID 统计 · 仅显示 3 条及以上作品的作者</span>
+          <button
+            className="text-action"
+            disabled={overview.loading}
+            aria-busy={overview.loading}
+            title="仅重新读取本机缓存并统计，不请求抖音"
+            onClick={overview.retry}
+          >
+            <RefreshCw className={overview.loading ? 'spin' : undefined} size={13} />
+            {overview.loading ? '统计中…' : '重新统计'}
+          </button>
+        </div>
+        {data ? (
+          data.authors.length ? (
+            <div className="dashboard-author-list" ref={authorsRef} onScroll={rememberAuthors}>
+              {data.authors.map((author) => (
+                <div className="dashboard-author-row" key={author.authorId} data-author-id={author.authorId}>
+                  <div className="dashboard-author-info">
+                    <button
+                      className="dashboard-author-name"
+                      title={`搜索作者：${author.name || author.authorId}`}
+                      onClick={() => searchAuthor(author.name || author.authorId)}
+                    >
+                      {author.name || author.authorId}
+                    </button>
+                    <button
+                      className="dashboard-author-id"
+                      aria-label={`搜索作者 ID ${author.authorId}`}
+                      title={`按作者 ID 搜索：${author.authorId}`}
+                      onClick={() => searchAuthor(author.authorId)}
+                    >
+                      ID: {author.authorId}
+                    </button>
+                    <span className="dashboard-author-breakdown">
+                      视频 {number(author.videos)} · 图集 {number(author.galleries)} · 文字{' '}
+                      {number(author.texts)}
+                    </span>
+                  </div>
+                  <span>{number(author.total)} 条</span>
+                </div>
+              ))}
+            </div>
+          ) : (
+            <div className="dashboard-author-empty">喜欢列表中暂无 3 条及以上作品的作者。</div>
+          )
+        ) : (
+          <div className="dashboard-author-empty">正在读取作者统计…</div>
+        )}
+      </section>
       <section className="dashboard-recent">
         <div className="dashboard-section-title">
           <h2>最近收录</h2>

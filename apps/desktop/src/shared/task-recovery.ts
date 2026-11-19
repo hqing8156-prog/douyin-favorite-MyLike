@@ -44,6 +44,13 @@ export function taskRecovery(code?: string | null, unknown = false): TaskRecover
         action: 'retry',
         actionLabel: '检查后重试'
       }
+    case 'AI_ACCESS_REJECTED':
+      return {
+        title: 'AI 模型调用未获授权',
+        message: 'API Key 已被识别，但当前账户或所用模型可能没有调用权限；请检查模型权限和账户额度。',
+        action: 'retry',
+        actionLabel: '检查后重试'
+      }
     case 'AI_DEEPSEEK_KEY_REQUIRED':
       return {
         title: '需要配置 AI 服务',
@@ -57,6 +64,28 @@ export function taskRecovery(code?: string | null, unknown = false): TaskRecover
         message: '有短标题视频需要语音识别，请先在设置中填写 SiliconFlow API Key，再重新开始 AI 分类。',
         action: 'retry',
         actionLabel: '填写后重试'
+      }
+    case 'AI_FFMPEG_REQUIRED':
+      return {
+        title: '需要安装 FFmpeg',
+        message: '视频画面识别需要 FFmpeg。安装后确保 ffmpeg 命令可用，再重新开始 AI 分类。',
+        action: 'retry',
+        actionLabel: '安装后重试'
+      }
+    case 'AI_VIDEO_TOO_LARGE':
+      return {
+        title: '视频文件过大',
+        message: '该视频文件过大，无法读取画面；该视频已跳过画面识别，其余作品会继续分类。',
+        action: 'retry',
+        actionLabel: '重试分类'
+      }
+    case 'AI_VIDEO_READ_FAILED':
+    case 'AI_VIDEO_FRAME_EXTRACTION_FAILED':
+      return {
+        title: '无法读取视频画面',
+        message: '暂时无法读取或提取该视频的画面，已跳过该视频的画面识别；请检查网络和 FFmpeg 后重试。',
+        action: 'retry',
+        actionLabel: '重试分类'
       }
     case 'AUTH_REQUIRED':
     case 'LOGIN_PENDING':

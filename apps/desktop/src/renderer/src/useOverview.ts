@@ -8,17 +8,23 @@ export function useOverview(accountId: string | null, revision: number, visible:
     null
   )
   const [retry, setRetry] = useState(0)
+  const [loading, setLoading] = useState(false)
   useEffect(() => {
     if (!accountId || !visible) return
     let current = true
-    void call(window.mylike.invoke('libraryOverview', { accountId })).then(
-      (data) => {
-        if (current) setResult({ accountId, data })
-      },
-      (error) => {
-        if (current) setResult({ accountId, error: error.message })
-      }
-    )
+    setLoading(true)
+    void call(window.mylike.invoke('libraryOverview', { accountId }))
+      .then(
+        (data) => {
+          if (current) setResult({ accountId, data })
+        },
+        (error) => {
+          if (current) setResult({ accountId, error: error.message })
+        }
+      )
+      .finally(() => {
+        if (current) setLoading(false)
+      })
     return () => {
       current = false
     }
@@ -27,6 +33,7 @@ export function useOverview(accountId: string | null, revision: number, visible:
   return {
     data: scoped?.data ?? null,
     error: scoped?.error ?? '',
+    loading: !!accountId && visible && loading,
     retry: () => setRetry((value) => value + 1)
   }
 }

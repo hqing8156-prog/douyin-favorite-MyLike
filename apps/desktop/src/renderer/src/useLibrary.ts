@@ -17,6 +17,8 @@ export function useLibrary(
 ) {
   const [search, setSearch] = useState('')
   const [type, setType] = useState<Filter['mediaType']>('all')
+  const [durationFilterEnabled, setDurationFilterEnabled] = useState(false)
+  const [durationThresholdMinutes, setDurationThresholdMinutes] = useState(1)
   const [year, setYear] = useState<number | null>(null)
   const [month, setMonth] = useState<number | null>(null)
   const sort: Filter['sort'] = 'published'
@@ -37,7 +39,16 @@ export function useLibrary(
     appendLock = useRef<object | null>(null)
   const sequence = useRef(0),
     selectionSequence = useRef(0)
-  const filter: Filter = { accountId: accountId ?? '', search, mediaType: type, year, month, sort, ...origin }
+  const filter: Filter = {
+    accountId: accountId ?? '',
+    search,
+    mediaType: type,
+    durationGreaterThanMs: durationFilterEnabled ? Math.floor(durationThresholdMinutes * 60_000) : null,
+    year,
+    month,
+    sort,
+    ...origin
+  }
   const key = JSON.stringify(filter),
     scope = useRef(key)
   scope.current = key
@@ -249,6 +260,10 @@ export function useLibrary(
     setSearch,
     type,
     setType,
+    durationFilterEnabled,
+    setDurationFilterEnabled,
+    durationThresholdMinutes,
+    setDurationThresholdMinutes,
     year,
     setYear,
     month,
@@ -261,6 +276,7 @@ export function useLibrary(
     resetFilters: () => {
       setSearch('')
       setType('all')
+      setDurationFilterEnabled(false)
       setYear(null)
       setMonth(null)
     },

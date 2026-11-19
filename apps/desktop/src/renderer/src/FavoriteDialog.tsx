@@ -1,8 +1,15 @@
-import { useEffect, useRef, useState } from 'react'
-import { FolderHeart, LoaderCircle, LockKeyhole, PlusCircle, Star, X } from 'lucide-react'
+import { useEffect, useMemo, useRef, useState } from 'react'
+import { LoaderCircle, LockKeyhole, PlusCircle, Search, Star, X } from 'lucide-react'
 import type { FavoriteEditor, PlaybackScope } from '../../shared/contracts'
 import { call, CommandError } from './api'
 import { favoriteWriteMessage } from './favorite-feedback'
+import { CoverImage } from './CoverImage'
+import {
+  readFavoriteFolderCovers,
+  readFavoriteFolderVisits,
+  recordFavoriteFolderVisits,
+  sortFavoriteFoldersByVisit
+} from './favorite-folder-recency'
 import './favorite-dialog.css'
 
 export function FavoriteDialog({
@@ -27,21 +34,38 @@ export function FavoriteDialog({
   const [loading, setLoading] = useState(true),
     [busy, setBusy] = useState(false)
   const [error, setError] = useState(''),
+    [visitError, setVisitError] = useState(''),
     [needsReload, setNeedsReload] = useState(false)
+  const [saveComplete, setSaveComplete] = useState(false)
+  const [folderVisits, setFolderVisits] = useState<Record<string, number>>({})
+  const [folderCovers, setFolderCovers] = useState<Record<string, string>>({})
+  const [searchOpen, setSearchOpen] = useState(false),
+    [folderSearch, setFolderSearch] = useState('')
   const [creating, setCreating] = useState(false),
     [name, setName] = useState(''),
     [secret, setSecret] = useState(true)
+  const sortedFolders = useMemo(
+    () => sortFavoriteFoldersByVisit(editor?.folders ?? [], folderVisits),
+    [editor?.folders, folderVisits]
+  )
+  const normalizedSearch = folderSearch.trim().toLocaleLowerCase()
+  const filteredFolders = normalizedSearch
+    ? sortedFolders.filter((folder) => folder.title.toLocaleLowerCase().includes(normalizedSearch))
+    : sortedFolders
+  const showDefaultFolder = !normalizedSearch || '默认收藏列表'.toLocaleLowerCase().includes(normalizedSearch)
 
-  const reload = async () => {
+  const reload = async (refreshFolders = false) => {
     if (pending.current) return
     const seq = ++sequence.current
     setLoading(true)
     setError('')
     try {
-      const next = await call(window.mylike.invoke('favoriteEditor', scope))
+      const next = await call(
+        window.mylike.invoke('favoriteEditor', refreshFolders ? { ...scope, refresh: true } : scope)
+      )
       if (!mounted.current || seq !== sequence.current) return
       setEditor(next)
-      setSelected([])
+      setSelected(next.folderIds)
       setNeedsReload(false)
       setCreating(false)
     } catch (error) {
@@ -56,6 +80,12 @@ export function FavoriteDialog({
   useEffect(() => {
     mounted.current = true
     dialog.current?.showModal()
+    try {
+      setFolderVisits(readFavoriteFolderVisits(scope.accountId))
+      setFolderCovers(readFavoriteFolderCovers(scope.accountId))
+    } catch (error) {
+      setVisitError(`读取收藏夹访问记录失败：${error instanceof Error ? error.message : '本地存储不可用。'}`)
+    }
     void reload()
     return () => {
       mounted.current = false
@@ -63,21 +93,37 @@ export function FavoriteDialog({
     }
   }, [])
   const save = async () => {
-    if (!editor || loading || needsReload || pending.current) return
+    if (!editor || loading || needsReload || pending.current || saveComplete) return
     pending.current = true
     setBusy(true)
     setError('')
     try {
+      const existing = new Set(editor.folderIds)
+      const addedFolderIds = selected.filter((id) => !existing.has(id))
       await call(
         window.mylike.invoke('favoriteSave', {
           accountId: scope.accountId,
           token: editor.token,
-          folderIds: selected
+          folderIds: addedFolderIds,
+          removeFolderIds: editor.folderIds.filter((id) => !selected.includes(id))
         })
       )
       if (mounted.current) {
+        let visitsSaved = true
+        try {
+          if (addedFolderIds.length) {
+            recordFavoriteFolderVisits(scope.accountId, addedFolderIds)
+            setVisitError('')
+          }
+        } catch (error) {
+          visitsSaved = false
+          setVisitError(
+            `收藏已保存，但记录收藏夹访问顺序失败：${error instanceof Error ? error.message : '本地存储不可用。'}`
+          )
+        }
         saved()
-        close()
+        if (visitsSaved) close()
+        else setSaveComplete(true)
       }
     } catch (error) {
       if (mounted.current) {
@@ -132,6 +178,19 @@ export function FavoriteDialog({
         <h2 id="favorite-dialog-title">选择收藏夹</h2>
         <button
           type="button"
+          className="favorite-search-trigger"
+          aria-label={searchOpen ? '关闭收藏夹搜索' : '搜索收藏夹'}
+          aria-pressed={searchOpen}
+          disabled={loading || busy || needsReload}
+          onClick={() => {
+            if (searchOpen) setFolderSearch('')
+            setSearchOpen(!searchOpen)
+          }}
+        >
+          <Search size={16} />
+        </button>
+        <button
+          type="button"
           className="favorite-create-trigger"
           disabled={loading || busy || needsReload}
           onClick={() => {
@@ -153,6 +212,31 @@ export function FavoriteDialog({
           <X size={18} />
         </button>
       </header>
+      {searchOpen && (
+        <div className="favorite-search-field">
+          <input
+            type="search"
+            aria-label="搜索收藏夹名称"
+            placeholder="搜索收藏夹"
+            value={folderSearch}
+            autoFocus
+            onChange={(event) => setFolderSearch(event.target.value)}
+            onKeyDown={(event) => {
+              if (event.key === 'Escape') {
+                event.preventDefault()
+                event.stopPropagation()
+                setFolderSearch('')
+                setSearchOpen(false)
+              }
+            }}
+          />
+          {folderSearch && (
+            <button type="button" aria-label="清空收藏夹搜索" onClick={() => setFolderSearch('')}>
+              <X size={14} />
+            </button>
+          )}
+        </div>
+      )}
       {creating && (
         <form
           className="favorite-create-form"
@@ -161,15 +245,31 @@ export function FavoriteDialog({
             void create()
           }}
         >
-          <input
-            aria-label="收藏夹名称"
-            placeholder="收藏夹名称"
-            maxLength={30}
-            value={name}
-            disabled={busy || needsReload}
-            autoFocus
-            onChange={(event) => setName(event.target.value)}
-          />
+          <span className="favorite-create-name">
+            <input
+              aria-label="收藏夹名称"
+              placeholder="收藏夹名称"
+              maxLength={30}
+              value={name}
+              disabled={busy || needsReload}
+              autoFocus
+              onChange={(event) => setName(event.target.value)}
+            />
+            <button
+              type="button"
+              className="favorite-cancel-create"
+              aria-label="取消新建收藏夹"
+              title="取消新建收藏夹"
+              disabled={busy}
+              onClick={() => {
+                setCreating(false)
+                setName('')
+                setError('')
+              }}
+            >
+              <X size={16} />
+            </button>
+          </span>
           <div>
             <label>
               <input
@@ -186,11 +286,11 @@ export function FavoriteDialog({
           </div>
         </form>
       )}
-      {!cloudSync && (
-        <p className="favorite-local-note" role="note">
-          云端写回已关闭，保存只会记录在本机；可在设置中开启“允许同步本地收藏夹到抖音”，再到收藏夹页写回云端。
-        </p>
-      )}
+      <p className="favorite-local-note" role="note">
+        {!cloudSync &&
+          '云端写回已关闭，新加入的收藏夹只会记录在本机；取消已存在项仍会从抖音收藏夹移除。可在设置中开启“允许同步本地收藏夹到抖音”，再到收藏夹页写回云端。'}
+        收藏夹列表使用本机已同步的数据；开启云端写回时，保存会实时核验云端状态。若刚在抖音新增收藏夹，请先同步收藏夹。
+      </p>
       {loading ? (
         <div className="favorite-loading" role="status">
           <LoaderCircle size={22} className="spin" />
@@ -199,16 +299,21 @@ export function FavoriteDialog({
       ) : (
         editor && (
           <div className="favorite-folder-list" aria-label="可选收藏夹" aria-busy={busy}>
-            <label className="favorite-folder-row favorite-default" title="收藏的作品都会保留在默认收藏列表">
-              <span className="favorite-folder-cover">
-                <Star size={24} fill="currentColor" />
-              </span>
-              <span className="favorite-folder-name">
-                默认收藏列表 <small>{editor.localCount}</small>
-              </span>
-              <input type="checkbox" aria-label="默认收藏列表" checked disabled />
-            </label>
-            {editor.folders.map((folder) => {
+            {showDefaultFolder && (
+              <label
+                className="favorite-folder-row favorite-default"
+                title="收藏的作品都会保留在默认收藏列表"
+              >
+                <span className="favorite-folder-cover">
+                  <Star size={24} fill="currentColor" />
+                </span>
+                <span className="favorite-folder-name">
+                  默认收藏列表 <small>{editor.localCount}</small>
+                </span>
+                <input type="checkbox" aria-label="默认收藏列表" checked disabled />
+              </label>
+            )}
+            {filteredFolders.map((folder) => {
               const alreadyAdded = editor.folderIds.includes(folder.id)
               return (
                 <label
@@ -217,11 +322,7 @@ export function FavoriteDialog({
                   title={alreadyAdded ? '该作品已在此收藏夹中' : undefined}
                 >
                   <span className="favorite-folder-cover">
-                    {folder.coverUrl ? (
-                      <img src={folder.coverUrl} alt="" referrerPolicy="no-referrer" />
-                    ) : (
-                      <FolderHeart size={24} />
-                    )}
+                    <CoverImage url={folderCovers[folder.id] ?? folder.coverUrl} size={24} />
                   </span>
                   <span className="favorite-folder-name" title={folder.title}>
                     <span>{folder.title}</span>
@@ -235,17 +336,24 @@ export function FavoriteDialog({
                   <input
                     type="checkbox"
                     aria-label={folder.title}
-                    checked={alreadyAdded || selected.includes(folder.id)}
-                    disabled={busy || needsReload || alreadyAdded}
+                    checked={selected.includes(folder.id)}
+                    disabled={busy || needsReload}
                     onChange={(event) =>
                       setSelected((ids) =>
-                        event.target.checked ? [...ids, folder.id] : ids.filter((id) => id !== folder.id)
+                        event.target.checked
+                          ? [...new Set([...ids, folder.id])]
+                          : ids.filter((id) => id !== folder.id)
                       )
                     }
                   />
                 </label>
               )
             })}
+            {normalizedSearch && !showDefaultFolder && filteredFolders.length === 0 && (
+              <p className="favorite-search-empty" role="status">
+                没有找到匹配的收藏夹。
+              </p>
+            )}
           </div>
         )
       )}
@@ -254,9 +362,14 @@ export function FavoriteDialog({
           {error}
         </div>
       )}
+      {visitError && (
+        <div className="favorite-error" role="alert">
+          {visitError}
+        </div>
+      )}
       {needsReload && !loading && (
         <div className="favorite-recovery">
-          <button disabled={busy} onClick={() => void reload()}>
+          <button disabled={busy} onClick={() => void reload(true)}>
             重新读取
           </button>
           <button disabled={busy} onClick={login}>
@@ -266,10 +379,12 @@ export function FavoriteDialog({
       )}
       <button
         className="favorite-save"
-        disabled={loading || busy || !editor || needsReload || creating}
+        disabled={loading || busy || !editor || needsReload || creating || saveComplete}
         onClick={() => void save()}
       >
-        {busy ? (
+        {saveComplete ? (
+          '已保存'
+        ) : busy ? (
           <>
             <LoaderCircle size={17} className="spin" />
             正在保存…

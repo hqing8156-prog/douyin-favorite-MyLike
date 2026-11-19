@@ -29,7 +29,6 @@ export function App() {
   const [folderId, setFolderId] = useState<string | null>(null)
   const [revision, setRevision] = useState(0)
   const [operation, setOperation] = useState('')
-  const [textScanStatus, setTextScanStatus] = useState<'running' | 'completed' | 'stopped' | undefined>()
   const [notice, setNotice] = useState('')
   const [error, setError] = useState('')
   const [classificationSource, setClassificationSource] = useState<AiClassificationSource | null>(null)
@@ -41,6 +40,10 @@ export function App() {
   const [moveTarget, setMoveTarget] = useState<{
     accountId: string
     fromFolderId: string
+    ids: string[]
+  } | null>(null)
+  const [addFavoriteTarget, setAddFavoriteTarget] = useState<{
+    accountId: string
     ids: string[]
   } | null>(null)
   const [unlikeTarget, setUnlikeTarget] = useState<{
@@ -82,6 +85,7 @@ export function App() {
   }, [accountId])
   useEffect(() => {
     setMoveTarget(null)
+    setAddFavoriteTarget(null)
   }, [accountId, folderId])
   useEffect(() => {
     if (
@@ -96,24 +100,6 @@ export function App() {
     void perform('向下采集', () =>
       call(window.mylike.invoke('collectionAction', { accountId, source: 'favorites', action: 'down' }))
     )
-  const scanTextWorks = (source: 'likes' | 'favorites') => {
-    if (!accountId) return
-    setTextScanStatus('running')
-    void perform('扫描文字作品', async () => {
-      const result = await call(window.mylike.invoke('scanTextWorks', { accountId, source }))
-      setNotice(
-        `扫描结束：尝试 ${result.scanned} 条，扫描成功 ${result.succeeded} 条，扫描失败 ${result.failed} 条，待稍后扫描 ${result.deferred} 条，识别文字 ${result.text} 条，新增文字 ${result.addedText} 条。`
-      )
-    }).then((success) => {
-      if (success) setTextScanStatus('completed')
-      else setTextScanStatus((current) => (current === 'running' ? undefined : current))
-    })
-  }
-  const stopTextScan = () => {
-    if (textScanStatus !== 'running') return
-    setTextScanStatus('stopped')
-    void perform('停止扫描', () => call(window.mylike.invoke('stopRequest', {})))
-  }
   const collecting =
     snapshot?.collection?.status === 'running' ||
     !!snapshot?.collectionActivity ||
@@ -170,7 +156,7 @@ export function App() {
   }, [notice])
   useEffect(() => {
     if (!error) return
-    const timer = setTimeout(() => setError(''), 3000)
+    const timer = setTimeout(() => setError(''), 8000)
     return () => clearTimeout(timer)
   }, [error])
   async function perform(label: string, fn: () => Promise<unknown>) {
@@ -211,12 +197,29 @@ export function App() {
     authorId: string | null,
     author: string,
     workId: string,
-    targetAccountId: string | null
+    targetAccountId: string | null,
+    authorUrl: string | null = null
   ) => {
     void (async () => {
       try {
+        if (!targetAccountId) {
+          setNotice('请先选择 MyLike 账号，再打开作者主页。')
+          return
+        }
+        const profileUrl =
+          authorUrl && /^https:\/\/(?:www\.)?douyin\.com\/user\/\S+$/.test(authorUrl) ? authorUrl : null
+        if (profileUrl) {
+          await call(
+            window.mylike.invoke('openAuthorProfile', {
+              accountId: targetAccountId,
+              authorUrl: profileUrl
+            })
+          )
+          setNotice(`已打开作者“${author}”的主页。`)
+          return
+        }
         let profileId = authorId
-        if (!profileId && targetAccountId) {
+        if (!profileId) {
           setNotice(`正在读取作者“${author}”的主页信息…`)
           const media = await call(window.mylike.invoke('media', { accountId: targetAccountId, workId }))
           profileId = media.work.authorId ?? null
@@ -225,7 +228,9 @@ export function App() {
           setNotice(`无法读取作者“${author}”的主页信息，请确认已登录抖音后重试。`)
           return
         }
-        await call(window.mylike.invoke('openAuthorProfile', { authorId: profileId }))
+        await call(
+          window.mylike.invoke('openAuthorProfile', { accountId: targetAccountId, authorId: profileId })
+        )
         setNotice(`已打开作者“${author}”的主页。`)
       } catch (e) {
         setError(`打开作者主页失败：${e instanceof Error ? e.message : String(e)}`)
@@ -320,12 +325,12 @@ export function App() {
           {(tab === 'library' || tab === 'favorites') && (
             <LibrarySearch value={library.search} change={library.setSearch} />
           )}
-          {tab === 'library' && (
+          {(tab === 'library' || tab === 'favorites') && (
             <div className="header-actions">
               <CollectionActions
                 snapshot={snapshot}
                 accountId={accountId}
-                source="likes"
+                source={tab === 'library' ? 'likes' : 'favorites'}
                 busy={busy}
                 perform={perform}
               />
@@ -354,6 +359,7 @@ export function App() {
           perform={perform}
           close={() => setClassificationSource(null)}
           onStart={() => setTab('tasks')}
+          onError={setError}
           notice={setNotice}
           aiPending={snapshot?.aiPendingAssignments}
         />
@@ -367,6 +373,11 @@ export function App() {
             add={() => setAdding(true)}
             play={startFromDashboard}
             resume={resumePlayback}
+            searchAuthor={(author) => {
+              likesLibrary.resetFilters()
+              likesLibrary.setSearch(author)
+              setTab('library')
+            }}
           />
         )}
         {(tab === 'faq' || tab === 'guide') && <HelpPage kind={tab} />}
@@ -393,6 +404,7 @@ export function App() {
             openClassification={openClassification}
             folderId={folderId}
             setFolderId={setFolderId}
+            error={error}
             notice={setNotice}
           />
         )}
@@ -412,7 +424,6 @@ export function App() {
                   : snapshot?.collection?.status === 'running' || !!snapshot?.collectionActivity,
               busy: busy || !!snapshot?.authentication
             }}
-            scanTextWorks={tab === 'library' ? () => scanTextWorks('likes') : undefined}
             play={(work) => startQueue('sequence', work)}
             playRange={startQueue}
             resume={snapshot?.playback && !snapshot.playback.completed ? snapshot.playback : null}
@@ -462,6 +473,15 @@ export function App() {
                   }
                 : undefined
             }
+            addToFavorites={
+              tab === 'library'
+                ? () => {
+                    if (!accountId || !library.selection.ids.size) return
+                    setError('')
+                    setAddFavoriteTarget({ accountId, ids: [...library.selection.ids] })
+                  }
+                : undefined
+            }
             removeFromFolder={() => {
               if (!accountId || !folderId || !library.selection.ids.size) return
               const ids = [...library.selection.ids]
@@ -490,10 +510,6 @@ export function App() {
             busy={busy}
             login={login}
             probe={probe}
-            scanTextWorks={scanTextWorks}
-            textScanStatus={textScanStatus}
-            textScan={snapshot?.textScan ?? null}
-            stopTextScan={stopTextScan}
             perform={perform}
             openClassification={openClassification}
             folders={favoriteFolders.folders}
@@ -539,6 +555,8 @@ export function App() {
             openAuthor={openAuthor}
             copyAuthor={copyAuthor}
             unlikeBusy={!!operation || unliking}
+            unlikeTask={snapshot?.unlike ?? null}
+            reportError={setError}
             libraryRevision={snapshot?.libraryRevision ?? 0}
             cloudSyncEnabled={snapshot?.appPreferences.syncFavoritesToCloud ?? false}
             unlike={(source) => {
@@ -618,23 +636,55 @@ export function App() {
           busy={!!operation}
           error={error}
           cancel={() => setMoveTarget(null)}
-          confirm={(toFolderId) =>
-            perform('移动收藏夹内容', async () => {
+          confirm={(addFolderIds, removeFolderIds) =>
+            perform('更新收藏夹内容', async () => {
               const result = await call(
-                window.mylike.invoke('favoriteFolderMoveWorks', {
+                window.mylike.invoke('favoriteFolderUpdateWorks', {
                   accountId: moveTarget.accountId,
                   fromFolderId: moveTarget.fromFolderId,
-                  toFolderId,
+                  addFolderIds,
+                  removeFolderIds,
                   workIds: moveTarget.ids
                 })
               )
               favoritesLibrary.selection.clear()
               setMoveTarget(null)
-              setNotice(
-                result.cloudSync
-                  ? `已把 ${result.moved} 条作品从“${result.fromFolderTitle}”移到“${result.toFolderTitle}”。`
-                  : `云端写回已关闭：已在本机把 ${result.moved} 条作品从“${result.fromFolderTitle}”移到“${result.toFolderTitle}”，抖音云端收藏夹未改动。`
+              const added = result.addedFolderTitles.length
+                ? `加入：${result.addedFolderTitles.map((title) => `“${title}”`).join('、')}。`
+                : ''
+              const removed = `移出：${result.removedFolderTitles.map((title) => `“${title}”`).join('、')}。`
+              const message = `已更新 ${result.updated} 条作品的收藏夹。${added}${removed}`
+              setNotice(result.cloudSync ? message : `云端写回已关闭：${message}抖音云端收藏夹未改动。`)
+            })
+          }
+        />
+      )}
+      {addFavoriteTarget && (
+        <MoveToFolderDialog
+          accountId={addFavoriteTarget.accountId}
+          workIds={addFavoriteTarget.ids}
+          folders={favoriteFolders.folders}
+          currentFolderId=""
+          addOnly
+          workCount={addFavoriteTarget.ids.length}
+          cloudSync={snapshot?.appPreferences.syncFavoritesToCloud ?? false}
+          busy={!!operation}
+          error={error}
+          cancel={() => setAddFavoriteTarget(null)}
+          confirm={(addFolderIds) =>
+            perform('添加到收藏夹', async () => {
+              const result = await call(
+                window.mylike.invoke('favoriteFolderAddWorks', {
+                  accountId: addFavoriteTarget.accountId,
+                  addFolderIds,
+                  workIds: addFavoriteTarget.ids
+                })
               )
+              likesLibrary.selection.clear()
+              setAddFavoriteTarget(null)
+              const folders = result.folderTitles.map((title) => `“${title}”`).join('、')
+              const message = `所选作品已处理，新增 ${result.added} 项收藏夹关联${folders ? `：${folders}` : ''}。`
+              setNotice(result.cloudSync ? message : `云端写回已关闭：${message}仅记录在本机。`)
             })
           }
         />

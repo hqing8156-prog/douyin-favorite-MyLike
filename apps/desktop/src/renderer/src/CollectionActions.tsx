@@ -17,7 +17,8 @@ export function CollectionActions({
   notice,
   folders = [],
   onManageLocalFolders,
-  foldersLoaded = true
+  foldersLoaded = true,
+  showCollectionControls = true
 }: {
   snapshot: Snapshot | null
   accountId: string | null
@@ -31,6 +32,7 @@ export function CollectionActions({
   folders?: FavoriteFolder[]
   onManageLocalFolders?: () => void
   foldersLoaded?: boolean
+  showCollectionControls?: boolean
 }) {
   const [writebackOpen, setWritebackOpen] = useState(false)
   const now = useRecoveryClock(snapshot?.recovery)
@@ -40,9 +42,15 @@ export function CollectionActions({
   const pending = [task, top].some((t) => t && t.status !== 'completed' && t.status !== 'stopped')
   const waiting = (operation: string) =>
     accountId ? recoveryUntil(accountId, ['self', operation], snapshot?.recovery) > now : false
-  const execute = (action: 'top' | 'down' | 'stop' | 'folders') =>
+  const execute = (action: 'top' | 'down' | 'stop' | 'folders' | 'rescan') =>
     void perform(
-      action === 'stop' ? '停止任务' : action === 'folders' ? '同步收藏夹' : '启动采集',
+      action === 'stop'
+        ? '停止任务'
+        : action === 'folders'
+          ? '同步收藏夹'
+          : action === 'rescan'
+            ? '重新扫描列表'
+            : '启动采集',
       async () => {
         if (!accountId) return
         await call(window.mylike.invoke('collectionAction', { accountId, source, action }))
@@ -53,28 +61,46 @@ export function CollectionActions({
       <div
         className="collection-controls"
         role="group"
-        aria-label={source === 'likes' ? '喜欢采集操作' : '收藏采集操作'}
+        aria-label={
+          showCollectionControls ? (source === 'likes' ? '喜欢采集操作' : '收藏采集操作') : '收藏夹云端操作'
+        }
       >
-        <button
-          disabled={!accountId || busy || running || waiting(source === 'likes' ? 'likes' : 'favorites')}
-          onClick={() => execute('top')}
-        >
-          更新顶部
-        </button>
-        <button
-          disabled={
-            !accountId ||
-            busy ||
-            running ||
-            waiting(source === 'likes' ? 'likes' : favoriteReadOperation(snapshot?.favorites))
-          }
-          onClick={() => execute('down')}
-        >
-          向下采集
-        </button>
-        <button disabled={!accountId || (!running && !pending)} onClick={() => execute('stop')}>
-          停止
-        </button>
+        {showCollectionControls && (
+          <>
+            <button
+              disabled={!accountId || busy || running || waiting(source === 'likes' ? 'likes' : 'favorites')}
+              onClick={() => execute('top')}
+            >
+              更新顶部
+            </button>
+            <button
+              disabled={
+                !accountId ||
+                busy ||
+                running ||
+                waiting(source === 'likes' ? 'likes' : favoriteReadOperation(snapshot?.favorites))
+              }
+              onClick={() => execute('down')}
+            >
+              向下采集
+            </button>
+            <button
+              disabled={
+                !accountId ||
+                busy ||
+                running ||
+                waiting(source === 'likes' ? 'likes' : favoriteReadOperation(snapshot?.favorites))
+              }
+              onClick={() => execute('rescan')}
+              title="临时：从列表开头重新遍历，按列表数据补齐作者 ID、封面和时长；比逐条读详情快很多"
+            >
+              重新扫描列表
+            </button>
+            <button disabled={!accountId || (!running && !pending)} onClick={() => execute('stop')}>
+              停止
+            </button>
+          </>
+        )}
         {syncFolders && (
           <button
             disabled={!accountId || busy || running || waiting('folders')}

@@ -1,4 +1,5 @@
 import { useEffect, useRef, useState, type RefObject } from 'react'
+import { createPortal } from 'react-dom'
 import { Heart, MessageCircle, X } from 'lucide-react'
 import type { CommentMediaSource, WorkComment } from '../../shared/contracts'
 import { call, CommandError } from './api'
@@ -11,10 +12,17 @@ type FeedProps = {
   login: () => void
   scroll: RefObject<HTMLDivElement | null>
   commentId?: string
+  onImageClick: (url: string, trigger: HTMLButtonElement) => void
 }
 type Failure = { cursor: string; message: string; login: boolean }
 
-function CommentAttachment({ sources }: { sources: CommentMediaSource[] }) {
+function CommentAttachment({
+  sources,
+  onImageClick
+}: {
+  sources: CommentMediaSource[]
+  onImageClick: (url: string, trigger: HTMLButtonElement) => void
+}) {
   const [index, setIndex] = useState(0)
   const source = sources[index]
   const fallback = () => setIndex((current) => (current === index ? current + 1 : current))
@@ -33,19 +41,26 @@ function CommentAttachment({ sources }: { sources: CommentMediaSource[] }) {
       onError={fallback}
     />
   ) : (
-    <img
-      className="comment-attachment"
-      key={source.url}
-      src={source.url}
-      alt="评论图片"
-      loading="lazy"
-      referrerPolicy="no-referrer"
-      onError={fallback}
-    />
+    <button
+      className="comment-image-trigger"
+      type="button"
+      aria-label="放大评论图片"
+      onClick={(event) => onImageClick(source.url, event.currentTarget)}
+    >
+      <img
+        className="comment-attachment"
+        key={source.url}
+        src={source.url}
+        alt="评论图片"
+        loading="lazy"
+        referrerPolicy="no-referrer"
+        onError={fallback}
+      />
+    </button>
   )
 }
 
-function CommentFeed({ scope, isCurrent, login, scroll, commentId }: FeedProps) {
+function CommentFeed({ scope, isCurrent, login, scroll, commentId, onImageClick }: FeedProps) {
   const [items, setItems] = useState<WorkComment[]>([])
   const [next, setNext] = useState<string | null>(null)
   const [loading, setLoading] = useState(true)
@@ -127,7 +142,11 @@ function CommentFeed({ scope, isCurrent, login, scroll, commentId }: FeedProps) 
                   {!!item.attachments.length && (
                     <div className="comment-images">
                       {item.attachments.map((sources) => (
-                        <CommentAttachment key={sources[0]!.url} sources={sources} />
+                        <CommentAttachment
+                          key={sources[0]!.url}
+                          sources={sources}
+                          onImageClick={onImageClick}
+                        />
                       ))}
                     </div>
                   )}
@@ -170,6 +189,7 @@ function CommentFeed({ scope, isCurrent, login, scroll, commentId }: FeedProps) 
                         login={login}
                         scroll={scroll}
                         commentId={item.id}
+                        onImageClick={onImageClick}
                       />
                     </div>
                   )}
@@ -215,22 +235,71 @@ function CommentFeed({ scope, isCurrent, login, scroll, commentId }: FeedProps) 
 export function CommentsPanel({
   close,
   ...feed
-}: Omit<FeedProps, 'commentId' | 'scroll'> & { close: () => void }) {
+}: Omit<FeedProps, 'commentId' | 'scroll' | 'onImageClick'> & { close: () => void }) {
   const closeButton = useRef<HTMLButtonElement>(null)
+  const previewCloseButton = useRef<HTMLButtonElement>(null)
+  const previewTrigger = useRef<HTMLButtonElement | null>(null)
   const scroll = useRef<HTMLDivElement>(null)
+  const [previewImage, setPreviewImage] = useState<string | null>(null)
   useEffect(() => closeButton.current?.focus(), [])
+  useEffect(() => {
+    if (!previewImage) return
+    const trigger = previewTrigger.current
+    previewCloseButton.current?.focus()
+    const closeOnEscape = (event: KeyboardEvent) => {
+      if (event.key === 'Escape') {
+        event.preventDefault()
+        event.stopPropagation()
+        setPreviewImage(null)
+      }
+    }
+    document.addEventListener('keydown', closeOnEscape)
+    return () => {
+      document.removeEventListener('keydown', closeOnEscape)
+      if (trigger?.isConnected) trigger.focus()
+    }
+  }, [previewImage])
+  const openImage = (url: string, trigger: HTMLButtonElement) => {
+    previewTrigger.current = trigger
+    setPreviewImage(url)
+  }
   return (
-    <aside className="comments-panel" aria-label="作品评论">
-      <header className="comments-heading">
-        <MessageCircle size={16} aria-hidden="true" />
-        <h2>评论</h2>
-        <button ref={closeButton} onClick={close} aria-label="关闭评论">
-          <X size={16} />
-        </button>
-      </header>
-      <div className="comments-scroll" ref={scroll}>
-        <CommentFeed {...feed} scroll={scroll} />
-      </div>
-    </aside>
+    <>
+      <aside className="comments-panel" aria-label="作品评论">
+        <header className="comments-heading">
+          <MessageCircle size={16} aria-hidden="true" />
+          <h2>评论</h2>
+          <button ref={closeButton} onClick={close} aria-label="关闭评论">
+            <X size={16} />
+          </button>
+        </header>
+        <div className="comments-scroll" ref={scroll}>
+          <CommentFeed {...feed} scroll={scroll} onImageClick={openImage} />
+        </div>
+      </aside>
+      {previewImage &&
+        createPortal(
+          <div className="comment-image-preview" onClick={() => setPreviewImage(null)}>
+            <div
+              className="comment-image-preview-dialog"
+              role="dialog"
+              aria-modal="true"
+              aria-label="评论图片预览"
+              onClick={(event) => event.stopPropagation()}
+            >
+              <button
+                ref={previewCloseButton}
+                className="comment-image-preview-close"
+                aria-label="关闭图片预览"
+                onClick={() => setPreviewImage(null)}
+              >
+                <X size={20} />
+              </button>
+              <img src={previewImage} alt="放大的评论图片" />
+            </div>
+          </div>,
+          document.body
+        )}
+    </>
   )
 }

@@ -9,10 +9,15 @@ import { WRITEBACK_BATCH_LIMIT } from '../shared/contracts'
 import type {
   Account,
   AiClassificationProgress,
+  AuthorIdRefreshCheckpoint,
   Command,
+  CoverRefreshCheckpoint,
+  DataMaintenanceFailureReason,
   Diagnostics,
+  DurationRefreshCheckpoint,
   Query,
-  Snapshot
+  Snapshot,
+  Work
 } from '../shared/contracts'
 import type { AppPreferences } from '../shared/preferences'
 import { Database } from './storage/client'
@@ -57,8 +62,43 @@ type WritebackResult = {
   remaining: number
   scopeRemaining: number
   skipped: number
+  completedItems: {
+    kind: string
+    folderId: string | null
+    workId: string | null
+    title: string | null
+    outcome: string
+  }[]
   skippedItems: { workId: string; kind: string; reason: string }[]
   truncated: boolean
+}
+type CoverRefreshTask = {
+  accountId: string
+  works: Work[]
+  nextIndex: number
+  updated: number
+  failed: number
+  lastRequestAt: number
+  pauseReason: 'verification' | 'limited' | 'manual' | null
+}
+const COVER_REFRESH_REQUEST_INTERVAL_MS = 1_000
+
+function recordMaintenanceFailure(reasons: Map<string, number>, reason: string): void {
+  reasons.set(reason, (reasons.get(reason) ?? 0) + 1)
+}
+
+function maintenanceFailureReasons(reasons: Map<string, number>): DataMaintenanceFailureReason[] {
+  return [...reasons].map(([reason, count]) => ({ reason, count }))
+}
+
+function maintenanceFailureReason(error: unknown): string {
+  if (error instanceof AppError) return `${error.code}：${error.message}`
+  if (error instanceof Error) return error.message
+  return '未知错误'
+}
+
+function maintenanceFailureSummary(reasons: Map<string, number>): string {
+  return [...reasons].map(([reason, count]) => `${reason} ${count} 条`).join('；') || '无'
 }
 
 export class Application {
@@ -69,7 +109,16 @@ export class Application {
   private readonly accessChecks = new Map<string, { accountId: string; operation: string; at: number }>()
   private playerVisible = false
   private busy = false
-  private textScan: Snapshot['textScan'] = null
+  private coverRefreshTask: CoverRefreshTask | null = null
+  private coverRefreshRunning = false
+  private coverRefreshAccountId: string | null = null
+  private coverRefreshStopRequested = false
+  private durationRefreshProgress: Snapshot['durationRefresh'] = null
+  private durationRefreshRunning = false
+  private durationRefreshStopRequested = false
+  private authorIdRefreshProgress: Snapshot['authorIdRefresh'] = null
+  private authorIdRefreshRunning = false
+  private authorIdRefreshStopRequested = false
   private aiClassification: AiClassificationProgress | null = null
   private epoch = 0
   private libraryRevision = 0
@@ -195,7 +244,11 @@ export class Application {
         this.aiClassification = progress
         changed()
       },
-      (line) => void this.logs.append('ai-classification.log', line)
+      (line) => void this.logs.append('ai-classification.log', line),
+      this.runBackground.bind(this),
+      (accountId, operation, parameters) =>
+        this.lane.run(false, () => engine.request(accountId, operation, parameters)),
+      (accountId, check) => this.lane.run(false, () => this.identity(accountId, check))
     )
     this.accounts = new AccountService(
       database,
@@ -213,7 +266,7 @@ export class Application {
         this.health.observe(accountId, event.operation, event.code, undefined, false, event.rule)
       this.changed()
     }
-    if (this.closing || (!runtimeEventCategory(event) && event.operation !== 'textScan')) return
+    if (this.closing || !runtimeEventCategory(event)) return
     void this.database
       .call('appendRuntimeEvent', { accountId, event })
       .then(() => this.changed())
@@ -229,7 +282,9 @@ export class Application {
       : 0
     return {
       accounts,
-      textScan: this.textScan,
+      coverRefresh: await this.coverRefreshSnapshot(activeAccountId),
+      durationRefresh: await this.durationRefreshSnapshot(activeAccountId),
+      authorIdRefresh: await this.authorIdRefreshSnapshot(activeAccountId),
       favoriteWritePending,
       favoriteSync:
         activeAccountId && this.favoriteSync?.accountId === activeAccountId
@@ -321,7 +376,7 @@ export class Application {
       throw new AppError('BUSY', '请先停止其他采集或取消点赞 / 收藏任务，再写回收藏夹。')
     return preferences
   }
-  private runFavoriteWritebackBatch(
+  private async runFavoriteWritebackBatch(
     accountId: string,
     scope: { folderIds: string[]; includeDefault: boolean },
     progress: WritebackProgress,
@@ -334,7 +389,7 @@ export class Application {
     progress.nextBatchAt = null
     this.changed()
     const batchStartedAt = Date.now()
-    return this.runUnlaned(accountId, (check) =>
+    const result = await this.runUnlaned(accountId, (check) =>
       this.favoriteActions.syncToCloud(accountId, check, scope, (update) => {
         progress.phase = update.phase
         progress.current = update.current
@@ -353,6 +408,22 @@ export class Application {
         this.changed()
       })
     )
+    await this.logs.append(
+      'favorite-writeback.log',
+      [
+        `===== ${new Date().toISOString()} 写回批次 ${progress.batch} 完成`,
+        `范围 folderIds=${scope.folderIds.join(',')} includeDefault=${scope.includeDefault}`,
+        `本批处理 ${result.synced} 个操作，跳过 ${result.skipped} 个作品；范围剩余 ${result.scopeRemaining} 个操作；全局队列剩余 ${result.remaining} 个操作`,
+        ...result.completedItems.map(
+          (item) =>
+            `已处理 kind=${item.kind} outcome=${item.outcome} folderId=${item.folderId ?? ''} workId=${item.workId ?? ''} title=${item.title ?? ''}`
+        ),
+        ...result.skippedItems.map(
+          (item) => `跳过 workId=${item.workId} kind=${item.kind} reason=${item.reason}`
+        )
+      ].join('\n')
+    )
+    return result
   }
   /** Runs the detached auto-continue loop; the start command returns immediately. */
   private async runFavoriteWritebackAuto(
@@ -364,9 +435,11 @@ export class Application {
   ): Promise<void> {
     const perOpMs = { value: 1500 }
     let stopped = false
+    let skipped = 0
     try {
       while (true) {
         const result = await this.runFavoriteWritebackBatch(accountId, scope, progress, perOpMs)
+        skipped += result.skipped
         if (result.scopeRemaining === 0 || this.favoriteSyncStopRequested || epoch !== this.epoch) break
         const latest = await this.database.call('appPreferences', {})
         progress.autoContinue = latest.autoContinueWriteback
@@ -391,7 +464,7 @@ export class Application {
       this.favoriteSyncLast = {
         accountId,
         status: stopped ? 'stopped' : 'completed',
-        message: null,
+        message: skipped ? `跳过 ${skipped} 个不可用作品，详情见本地写回日志` : null,
         at: Date.now()
       }
     } catch (error) {
@@ -413,13 +486,19 @@ export class Application {
     }
   }
   private async recordWritebackFailure(accountId: string, error: unknown): Promise<void> {
-    if (!(error instanceof AppError) || ['CANCELLED', 'CLOSING'].includes(error.code)) return
-    const pending = await this.database.call('favoriteWriteOps', { accountId }).catch(() => [])
+    const code = error instanceof AppError ? error.code : 'WRITEBACK_ERROR'
+    if (['CANCELLED', 'CLOSING'].includes(code)) return
+    const message = error instanceof Error ? error.message : String(error)
+    const pending = await this.database.call('favoriteWriteOps', { accountId }).catch((queueError) => {
+      console.error('[MyLike] Failed to read pending writeback operations for the failure log.', queueError)
+      return []
+    })
     const listed = pending.slice(0, 100)
-    void this.logs.append(
+    await this.logs.append(
       'favorite-writeback.log',
       [
-        `===== ${new Date().toISOString()} 写回失败：${error.code} ${error.message}`,
+        `===== ${new Date().toISOString()} 写回失败：${code} ${message}`,
+        ...(error instanceof AppError && error.diagnostic ? [`诊断：${error.diagnostic}`] : []),
         `剩余 ${pending.length} 项：`,
         ...listed.map(
           (operation) =>
@@ -482,6 +561,758 @@ export class Application {
    */
   private async runUnlaned<T>(accountId: string, operation: (check: () => void) => Promise<T>): Promise<T> {
     return this.guarded(accountId, operation)
+  }
+  private async coverRefreshSnapshot(accountId: string | null): Promise<Snapshot['coverRefresh']> {
+    if (!accountId) return null
+    const task =
+      this.coverRefreshTask?.accountId === accountId
+        ? this.coverRefreshTask
+        : await this.database.call('coverRefreshCheckpoint', { accountId })
+    if (!task) return null
+    const running = this.coverRefreshRunning && this.coverRefreshAccountId === accountId
+    const total = 'works' in task ? task.works.length : task.workIds.length
+    return {
+      accountId,
+      current: task.nextIndex,
+      total,
+      updated: task.updated,
+      failed: task.failed,
+      status: running ? 'running' : 'paused',
+      pauseReason: running ? task.pauseReason : (task.pauseReason ?? 'interrupted')
+    }
+  }
+  private async durationRefreshSnapshot(accountId: string | null): Promise<Snapshot['durationRefresh']> {
+    if (!accountId) return null
+    if (this.durationRefreshProgress?.accountId === accountId) return this.durationRefreshProgress
+    const task = await this.database.call('durationRefreshCheckpoint', { accountId })
+    if (!task) return null
+    return {
+      accountId,
+      current: task.nextIndex,
+      total: task.workIds.length,
+      updated: task.updated,
+      failed: task.failed,
+      status: 'paused',
+      pauseReason: task.pauseReason ?? 'interrupted',
+      stopping: false
+    }
+  }
+  private async authorIdRefreshSnapshot(accountId: string | null): Promise<Snapshot['authorIdRefresh']> {
+    if (!accountId) return null
+    if (this.authorIdRefreshProgress?.accountId === accountId) return this.authorIdRefreshProgress
+    const task = await this.database.call('authorIdRefreshCheckpoint', { accountId })
+    if (!task) return null
+    return {
+      accountId,
+      current: task.nextIndex,
+      total: task.workIds.length,
+      updated: task.updated,
+      failed: task.failed,
+      status: 'paused',
+      pauseReason: task.pauseReason ?? 'interrupted',
+      stopping: false
+    }
+  }
+  private async saveCoverRefreshTask(task: CoverRefreshTask): Promise<void> {
+    const checkpoint: CoverRefreshCheckpoint = {
+      accountId: task.accountId,
+      workIds: task.works.map((work) => work.id),
+      nextIndex: task.nextIndex,
+      updated: task.updated,
+      failed: task.failed,
+      lastRequestAt: task.lastRequestAt,
+      pauseReason: task.pauseReason
+    }
+    await this.database.call('saveCoverRefreshCheckpoint', { checkpoint })
+  }
+  private async fetchMissingCovers(accountId: string) {
+    if (this.coverRefreshRunning || this.durationRefreshRunning || this.authorIdRefreshRunning)
+      throw new AppError('BUSY', '另一个元数据补全任务正在运行。')
+    this.coverRefreshRunning = true
+    this.coverRefreshAccountId = accountId
+    this.coverRefreshStopRequested = false
+    try {
+      return await this.runBackground(accountId, async (check) => {
+        await Promise.all([this.favorites.pause(), this.collection.pause()])
+        await this.lane.run(true, () => this.identity(accountId, check))
+        const previous =
+          this.coverRefreshTask?.accountId === accountId
+            ? this.coverRefreshTask
+            : await this.database.call('coverRefreshCheckpoint', { accountId })
+        if (previous?.failed === 0 && previous.nextIndex > 0) {
+          const completedWorkIds =
+            'works' in previous
+              ? previous.works.slice(0, previous.nextIndex).map((work) => work.id)
+              : previous.workIds.slice(0, previous.nextIndex)
+          await this.database.call('coverRefreshMarkCompleted', {
+            accountId,
+            workIds: completedWorkIds
+          })
+        }
+        const previousTotal = previous
+          ? 'works' in previous
+            ? previous.works.length
+            : previous.workIds.length
+          : 0
+        const works: Work[] = []
+        for (let offset = 0; ; offset += 120) {
+          check()
+          const page = await this.database.call('missingCoverWorks', { accountId, offset, limit: 120 })
+          works.push(...page)
+          if (page.length < 120) break
+        }
+        const task: CoverRefreshTask = {
+          accountId,
+          works,
+          nextIndex: 0,
+          updated: previous?.updated ?? 0,
+          failed: previous?.failed ?? 0,
+          lastRequestAt: previous?.lastRequestAt ?? 0,
+          pauseReason: null
+        }
+        this.coverRefreshTask = task
+        await this.logs.append(
+          'cover-refresh.log',
+          `${new Date().toISOString()} ${previous ? `刷新断点：上次进度 ${previous.nextIndex}/${previousTotal}，剩余待处理 ${task.works.length} 条` : `开始获取：待处理 ${task.works.length} 条`}，累计已获取 ${task.updated} 张，失败 ${task.failed} 条。`
+        )
+        if (!works.length) {
+          this.coverRefreshTask = null
+          await this.database.call('deleteCoverRefreshCheckpoint', { accountId })
+          this.changed()
+          return {
+            total: 0,
+            updated: 0,
+            failed: 0,
+            failureReasons: [],
+            deferred: 0,
+            needsVerification: false,
+            stopped: false
+          }
+        }
+        await this.saveCoverRefreshTask(task)
+        this.changed()
+
+        let deferred = 0
+        let needsVerification = false
+        const failureReasons = new Map<string, number>()
+        const updatedBeforeRun = task.updated
+        const failedBeforeRun = task.failed
+        for (let index = task.nextIndex; index < task.works.length; index++) {
+          const work = task.works[index]!
+          if (this.coverRefreshStopRequested) {
+            task.pauseReason = 'manual'
+            await this.saveCoverRefreshTask(task)
+            break
+          }
+          const remainingDelay = COVER_REFRESH_REQUEST_INTERVAL_MS - (Date.now() - task.lastRequestAt)
+          if (remainingDelay > 0) await new Promise<void>((resolve) => setTimeout(resolve, remainingDelay))
+          if (this.coverRefreshStopRequested) {
+            task.pauseReason = 'manual'
+            await this.saveCoverRefreshTask(task)
+            break
+          }
+          check()
+          let pauseAfterCurrent = false
+          try {
+            const response = await this.lane.run(true, () =>
+              this.engine.request(accountId, 'detail', {
+                aweme_id: work.id,
+                publish_video_strategy_type: '2',
+                pc_client_type: '1'
+              })
+            )
+            task.lastRequestAt = Date.now()
+            check()
+            const media = parseMedia(response)
+            if (media.work.id !== work.id)
+              throw new AppError('INVALID_RESPONSE', '作品详情与请求目标不一致。')
+            if (!media.work.coverUrl) {
+              task.failed++
+              recordMaintenanceFailure(failureReasons, '详情未提供封面地址')
+              await this.logs.append(
+                'cover-refresh.log',
+                `${new Date().toISOString()} 作品失败 ${index + 1}/${task.works.length}，作品 ${work.id}，原因：详情未提供封面地址。\n`
+              )
+            } else {
+              await this.database.call('coverRefreshSaveWork', { accountId, work: media.work })
+              task.updated++
+            }
+            task.nextIndex = index + 1
+            this.changed()
+          } catch (error) {
+            task.lastRequestAt = Date.now()
+            if (error instanceof AppError && error.code === 'CANCELLED') throw error
+            if (
+              error instanceof AppError &&
+              [
+                'RATE_LIMITED',
+                'UPSTREAM_RISK_CONTROL',
+                'AUTH_REQUIRED',
+                'VERIFICATION_REQUIRED',
+                'NETWORK_ERROR',
+                'TIMEOUT',
+                'BROWSER_NOT_READY',
+                'BROWSER_CRASHED',
+                'PAGE_CHANGED'
+              ].includes(error.code)
+            ) {
+              deferred = task.works.length - index
+              needsVerification = ['AUTH_REQUIRED', 'VERIFICATION_REQUIRED'].includes(error.code)
+              task.pauseReason = needsVerification ? 'verification' : 'limited'
+              await this.logs.append(
+                'cover-refresh.log',
+                `${new Date().toISOString()} 暂停于 ${index + 1}/${task.works.length}，作品 ${work.id}，错误 ${error.code}：${error.message}`
+              )
+              this.record(accountId, {
+                kind: 'task',
+                operation: 'coverRefresh',
+                message: needsVerification
+                  ? `需要在抖音窗口完成登录或验证；已获取 ${task.updated} 张缩略图，完成后可继续，当前作品会重试。`
+                  : `抖音暂时限制详情读取，已获取 ${task.updated} 张缩略图，剩余 ${deferred} 条待稍后继续。`,
+                code: error.code
+              })
+              pauseAfterCurrent = true
+            } else {
+              task.failed++
+              recordMaintenanceFailure(failureReasons, maintenanceFailureReason(error))
+              task.nextIndex = index + 1
+              this.changed()
+              console.warn(`[cover] refresh failed for work ${work.id}`, error)
+              await this.logs.append(
+                'cover-refresh.log',
+                `${new Date().toISOString()} 作品失败 ${index + 1}/${task.works.length}，作品 ${work.id}，${error instanceof AppError ? `${error.code}: ` : ''}${error instanceof Error ? error.message : String(error)}`
+              )
+            }
+          }
+          await this.saveCoverRefreshTask(task)
+          if (task.nextIndex > 0 && task.nextIndex % 50 === 0)
+            await this.logs.append(
+              'cover-refresh.log',
+              `${new Date().toISOString()} 进度 ${task.nextIndex}/${task.works.length}，已获取 ${task.updated} 张，失败 ${task.failed} 条。`
+            )
+          if (pauseAfterCurrent) break
+          if (this.coverRefreshStopRequested) {
+            task.pauseReason = 'manual'
+            await this.saveCoverRefreshTask(task)
+            await this.logs.append(
+              'cover-refresh.log',
+              `${new Date().toISOString()} 手动停止于 ${task.nextIndex}/${task.works.length}，已获取 ${task.updated} 张，失败 ${task.failed} 条。`
+            )
+            break
+          }
+        }
+
+        const completed = task.nextIndex >= task.works.length
+        if (!completed)
+          await this.logs.append(
+            'cover-refresh.log',
+            `${new Date().toISOString()} 任务暂停（${task.pauseReason ?? 'interrupted'}）：${task.nextIndex}/${task.works.length}，已获取 ${task.updated} 张，失败 ${task.failed} 条。`
+          )
+        if (task.updated) this.libraryRevision++
+        if (completed) {
+          const failureSummary = maintenanceFailureSummary(failureReasons)
+          await this.logs.append(
+            'cover-refresh.log',
+            `${new Date().toISOString()} 获取结束：本轮检查 ${task.works.length} 条，获取 ${task.updated - updatedBeforeRun} 张，失败 ${task.failed - failedBeforeRun} 条；失败原因：${failureSummary}。`
+          )
+          this.record(accountId, {
+            kind: 'task',
+            operation: 'coverRefresh',
+            message: `封面补全结束：本轮检查 ${task.works.length} 条，获取 ${task.updated - updatedBeforeRun} 张，失败 ${task.failed - failedBeforeRun} 条；失败原因：${failureSummary}。`
+          })
+          this.coverRefreshTask = null
+          await this.database.call('deleteCoverRefreshCheckpoint', { accountId })
+        }
+        this.changed()
+        return {
+          total: task.works.length,
+          updated: task.updated - updatedBeforeRun,
+          failed: task.failed - failedBeforeRun,
+          failureReasons: maintenanceFailureReasons(failureReasons),
+          deferred: completed ? 0 : deferred || task.works.length - task.nextIndex,
+          needsVerification,
+          stopped: !completed && task.pauseReason === 'manual'
+        }
+      })
+    } finally {
+      this.coverRefreshRunning = false
+      this.coverRefreshAccountId = null
+      this.coverRefreshStopRequested = false
+      this.changed()
+    }
+  }
+  private stopMissingCovers(accountId: string): null {
+    if (this.coverRefreshRunning && this.coverRefreshAccountId === accountId) {
+      this.coverRefreshStopRequested = true
+      this.changed()
+    }
+    return null
+  }
+  private async syncVideoDurations(accountId: string) {
+    if (this.durationRefreshRunning || this.coverRefreshRunning || this.authorIdRefreshRunning)
+      throw new AppError('BUSY', '另一个元数据补全任务正在运行。')
+    this.durationRefreshRunning = true
+    this.durationRefreshStopRequested = false
+    const progress: NonNullable<Snapshot['durationRefresh']> = {
+      accountId,
+      current: 0,
+      total: 0,
+      updated: 0,
+      failed: 0,
+      status: 'running',
+      pauseReason: null,
+      stopping: false
+    }
+    this.durationRefreshProgress = progress
+    try {
+      this.changed()
+      return await this.runBackground(accountId, async (check) => {
+        await Promise.all([this.favorites.pause(), this.collection.pause()])
+        await this.lane.run(true, () => this.identity(accountId, check))
+        const checkpoint = await this.database.call('durationRefreshCheckpoint', { accountId })
+        const works: Work[] = []
+        for (let offset = 0; ; offset += 120) {
+          check()
+          const page = await this.database.call('missingDurationWorks', { accountId, offset, limit: 120 })
+          works.push(...page)
+          progress.total = works.length
+          this.changed()
+          if (page.length < 120) break
+        }
+        if (!checkpoint && !works.length)
+          return {
+            total: 0,
+            updated: 0,
+            failed: 0,
+            failureReasons: [],
+            deferred: 0,
+            needsVerification: false,
+            stopped: false
+          }
+
+        const task: DurationRefreshCheckpoint = checkpoint ?? {
+          accountId,
+          workIds: works.map((work) => work.id),
+          nextIndex: 0,
+          updated: 0,
+          failed: 0,
+          lastRequestAt: Date.now(),
+          pauseReason: null
+        }
+        const missingById = new Map(works.map((work) => [work.id, work]))
+        progress.total = task.workIds.length
+        progress.current = task.nextIndex
+        progress.updated = task.updated
+        progress.failed = task.failed
+        progress.pauseReason = null
+        await this.database.call('saveDurationRefreshCheckpoint', {
+          checkpoint: { ...task, pauseReason: null }
+        })
+        task.pauseReason = null
+        this.changed()
+
+        let deferred = 0
+        let needsVerification = false
+        const failureReasons = new Map<string, number>()
+        const failedBeforeRun = task.failed
+        for (let index = task.nextIndex; index < task.workIds.length; index++) {
+          if (this.durationRefreshStopRequested) {
+            task.nextIndex = index
+            task.pauseReason = 'manual'
+            await this.database.call('saveDurationRefreshCheckpoint', { checkpoint: task })
+            progress.current = task.nextIndex
+            progress.status = 'paused'
+            progress.pauseReason = 'manual'
+            deferred = task.workIds.length - index
+            this.changed()
+            break
+          }
+          const workId = task.workIds[index]!
+          const work = missingById.get(workId)
+          if (!work) {
+            task.nextIndex = index + 1
+            await this.database.call('saveDurationRefreshCheckpoint', { checkpoint: task })
+            progress.current = task.nextIndex
+            this.changed()
+            continue
+          }
+          const remainingDelay = COVER_REFRESH_REQUEST_INTERVAL_MS - (Date.now() - task.lastRequestAt)
+          if (remainingDelay > 0) await new Promise<void>((resolve) => setTimeout(resolve, remainingDelay))
+          if (this.durationRefreshStopRequested) {
+            task.nextIndex = index
+            task.pauseReason = 'manual'
+            await this.database.call('saveDurationRefreshCheckpoint', { checkpoint: task })
+            progress.current = task.nextIndex
+            progress.status = 'paused'
+            progress.pauseReason = 'manual'
+            deferred = task.workIds.length - index
+            this.changed()
+            break
+          }
+          check()
+          let media: ReturnType<typeof parseMedia>
+          try {
+            const response = await this.lane.run(true, () =>
+              this.engine.request(accountId, 'detail', {
+                aweme_id: workId,
+                publish_video_strategy_type: '2',
+                pc_client_type: '1'
+              })
+            )
+            task.lastRequestAt = Date.now()
+            check()
+            media = parseMedia(response)
+            if (media.work.id !== workId) throw new AppError('INVALID_RESPONSE', '作品详情与请求目标不一致。')
+          } catch (error) {
+            task.lastRequestAt = Date.now()
+            if (error instanceof AppError && ['CANCELLED', 'CLOSING'].includes(error.code)) throw error
+            if (
+              error instanceof AppError &&
+              [
+                'RATE_LIMITED',
+                'UPSTREAM_RISK_CONTROL',
+                'AUTH_REQUIRED',
+                'VERIFICATION_REQUIRED',
+                'NETWORK_ERROR',
+                'TIMEOUT',
+                'BROWSER_NOT_READY',
+                'BROWSER_CRASHED',
+                'PAGE_CHANGED'
+              ].includes(error.code)
+            ) {
+              task.nextIndex = index
+              needsVerification = ['AUTH_REQUIRED', 'VERIFICATION_REQUIRED'].includes(error.code)
+              task.pauseReason = needsVerification ? 'verification' : 'limited'
+              await this.database.call('saveDurationRefreshCheckpoint', { checkpoint: task })
+              progress.current = task.nextIndex
+              progress.status = 'paused'
+              progress.pauseReason = task.pauseReason
+              deferred = task.workIds.length - index
+              this.changed()
+              break
+            }
+            task.failed++
+            recordMaintenanceFailure(failureReasons, maintenanceFailureReason(error))
+            task.nextIndex = index + 1
+            task.pauseReason = null
+            await this.database.call('saveDurationRefreshCheckpoint', { checkpoint: task })
+            progress.current = task.nextIndex
+            progress.failed = task.failed
+            this.changed()
+            console.warn(`[duration] refresh failed for work ${workId}`, error)
+            await this.logs.append(
+              'duration-refresh.log',
+              `${new Date().toISOString()} 作品失败 ${index + 1}/${task.workIds.length}，作品 ${workId}，${error instanceof AppError ? `${error.code}: ` : ''}${error instanceof Error ? error.message : String(error)}\n`
+            )
+            continue
+          }
+          if (media.work.durationMs && media.work.durationMs > 0) {
+            await this.database.call('updateWork', { work: media.work })
+            task.updated++
+          } else {
+            task.failed++
+            recordMaintenanceFailure(failureReasons, '详情未提供有效视频时长')
+            await this.logs.append(
+              'duration-refresh.log',
+              `${new Date().toISOString()} 作品失败 ${index + 1}/${task.workIds.length}，作品 ${workId}，原因：详情未提供有效视频时长（durationMs=${media.work.durationMs ?? 0}）。\n`
+            )
+          }
+          task.nextIndex = index + 1
+          task.pauseReason = null
+          await this.database.call('saveDurationRefreshCheckpoint', { checkpoint: task })
+          progress.current = task.nextIndex
+          progress.updated = task.updated
+          progress.failed = task.failed
+          this.changed()
+        }
+        const stopped = this.durationRefreshStopRequested
+        const completed = task.nextIndex >= task.workIds.length
+        if (completed) {
+          await this.database.call('deleteDurationRefreshCheckpoint', { accountId })
+          if (task.updated) this.libraryRevision++
+        }
+        const result = {
+          total: task.workIds.length,
+          updated: task.updated,
+          failed: task.failed - failedBeforeRun,
+          failureReasons: maintenanceFailureReasons(failureReasons),
+          deferred: completed ? 0 : deferred || task.workIds.length - task.nextIndex,
+          needsVerification,
+          stopped
+        }
+        await this.logs.append(
+          'duration-refresh.log',
+          `${new Date().toISOString()} ${stopped ? '手动停止' : result.deferred ? '稍后继续' : '同步结束'}：未同步 ${result.failed + result.deferred} 条（失败 ${result.failed} 条，待处理 ${result.deferred} 条）；失败原因：${maintenanceFailureSummary(failureReasons)}。\n`
+        )
+        return result
+      })
+    } finally {
+      this.durationRefreshRunning = false
+      this.durationRefreshStopRequested = false
+      this.durationRefreshProgress = null
+      this.changed()
+    }
+  }
+  private stopVideoDurationSync(accountId: string): null {
+    if (this.durationRefreshRunning && this.durationRefreshProgress?.accountId === accountId) {
+      this.durationRefreshStopRequested = true
+      this.durationRefreshProgress.stopping = true
+      this.changed()
+    }
+    return null
+  }
+  private async syncMissingAuthorIds(accountId: string) {
+    if (this.authorIdRefreshRunning || this.coverRefreshRunning || this.durationRefreshRunning)
+      throw new AppError('BUSY', '另一个元数据补全任务正在运行。')
+    this.authorIdRefreshRunning = true
+    this.authorIdRefreshStopRequested = false
+    const progress: NonNullable<Snapshot['authorIdRefresh']> = {
+      accountId,
+      current: 0,
+      total: 0,
+      updated: 0,
+      failed: 0,
+      status: 'running',
+      pauseReason: null,
+      stopping: false
+    }
+    this.authorIdRefreshProgress = progress
+    try {
+      this.changed()
+      return await this.runBackground(accountId, async (check) => {
+        await Promise.all([this.favorites.pause(), this.collection.pause()])
+        await this.lane.run(true, () => this.identity(accountId, check))
+        const checkpoint = await this.database.call('authorIdRefreshCheckpoint', { accountId })
+        const works: Work[] = []
+        for (let offset = 0; ; offset += 120) {
+          check()
+          const page = await this.database.call('missingAuthorIdWorks', {
+            accountId,
+            offset,
+            limit: 120
+          })
+          works.push(...page)
+          progress.total = works.length
+          this.changed()
+          if (page.length < 120) break
+        }
+        if (!checkpoint && !works.length)
+          return {
+            total: 0,
+            updated: 0,
+            failed: 0,
+            failureReasons: [],
+            deferred: 0,
+            needsVerification: false,
+            stopped: false
+          }
+
+        const task: AuthorIdRefreshCheckpoint = checkpoint ?? {
+          accountId,
+          workIds: works.map((work) => work.id),
+          nextIndex: 0,
+          updated: 0,
+          failed: 0,
+          lastRequestAt: Date.now(),
+          pauseReason: null
+        }
+        const missingById = new Map(works.map((work) => [work.id, work]))
+        progress.total = task.workIds.length
+        progress.current = task.nextIndex
+        progress.updated = task.updated
+        progress.failed = task.failed
+        progress.pauseReason = null
+        await this.database.call('saveAuthorIdRefreshCheckpoint', {
+          checkpoint: { ...task, pauseReason: null }
+        })
+        task.pauseReason = null
+        this.changed()
+
+        let deferred = 0
+        let needsVerification = false
+        const failureReasons = new Map<string, number>()
+        const failedBeforeRun = task.failed
+        for (let index = task.nextIndex; index < task.workIds.length; index++) {
+          if (this.authorIdRefreshStopRequested) {
+            task.nextIndex = index
+            task.pauseReason = 'manual'
+            await this.database.call('saveAuthorIdRefreshCheckpoint', { checkpoint: task })
+            progress.current = task.nextIndex
+            progress.status = 'paused'
+            progress.pauseReason = 'manual'
+            deferred = task.workIds.length - index
+            this.changed()
+            break
+          }
+          const workId = task.workIds[index]!
+          if (!missingById.has(workId)) {
+            task.nextIndex = index + 1
+            await this.database.call('saveAuthorIdRefreshCheckpoint', { checkpoint: task })
+            progress.current = task.nextIndex
+            this.changed()
+            continue
+          }
+          const before = missingById.get(workId)!
+          const hadAuthorId = !!before.authorId && /^[A-Za-z0-9_-]{8,200}$/.test(before.authorId)
+          const hadCover = !!before.coverUrl && before.coverUrl.trim() !== ''
+          const hadDuration = (before.durationMs ?? 0) > 0
+          const hadAuthorUrl = !!before.authorUrl && before.authorUrl.trim() !== ''
+          const remainingDelay = COVER_REFRESH_REQUEST_INTERVAL_MS - (Date.now() - task.lastRequestAt)
+          if (remainingDelay > 0) await new Promise<void>((resolve) => setTimeout(resolve, remainingDelay))
+          if (this.authorIdRefreshStopRequested) {
+            task.nextIndex = index
+            task.pauseReason = 'manual'
+            await this.database.call('saveAuthorIdRefreshCheckpoint', { checkpoint: task })
+            progress.current = task.nextIndex
+            progress.status = 'paused'
+            progress.pauseReason = 'manual'
+            deferred = task.workIds.length - index
+            this.changed()
+            break
+          }
+          check()
+          let media: ReturnType<typeof parseMedia>
+          try {
+            const response = await this.lane.run(true, () =>
+              this.engine.request(accountId, 'detail', {
+                aweme_id: workId,
+                publish_video_strategy_type: '2',
+                pc_client_type: '1'
+              })
+            )
+            task.lastRequestAt = Date.now()
+            check()
+            media = parseMedia(response)
+            if (media.work.id !== workId) throw new AppError('INVALID_RESPONSE', '作品详情与请求目标不一致。')
+          } catch (error) {
+            task.lastRequestAt = Date.now()
+            if (error instanceof AppError && ['CANCELLED', 'CLOSING'].includes(error.code)) throw error
+            if (
+              error instanceof AppError &&
+              [
+                'RATE_LIMITED',
+                'UPSTREAM_RISK_CONTROL',
+                'AUTH_REQUIRED',
+                'VERIFICATION_REQUIRED',
+                'NETWORK_ERROR',
+                'TIMEOUT',
+                'BROWSER_NOT_READY',
+                'BROWSER_CRASHED',
+                'PAGE_CHANGED'
+              ].includes(error.code)
+            ) {
+              task.nextIndex = index
+              needsVerification = ['AUTH_REQUIRED', 'VERIFICATION_REQUIRED'].includes(error.code)
+              task.pauseReason = needsVerification ? 'verification' : 'limited'
+              await this.database.call('saveAuthorIdRefreshCheckpoint', { checkpoint: task })
+              progress.current = task.nextIndex
+              progress.status = 'paused'
+              progress.pauseReason = task.pauseReason
+              deferred = task.workIds.length - index
+              this.changed()
+              break
+            }
+            task.failed++
+            recordMaintenanceFailure(failureReasons, maintenanceFailureReason(error))
+            task.nextIndex = index + 1
+            task.pauseReason = null
+            await this.database.call('saveAuthorIdRefreshCheckpoint', { checkpoint: task })
+            progress.current = task.nextIndex
+            progress.failed = task.failed
+            this.changed()
+            console.warn(`[author-id] refresh failed for work ${workId}`, error)
+            await this.logs.append(
+              'author-id-refresh.log',
+              `${new Date().toISOString()} 作品失败 ${index + 1}/${task.workIds.length}，作品 ${workId}，${error instanceof AppError ? `${error.code}: ` : ''}${error instanceof Error ? error.message : String(error)}\n`
+            )
+            continue
+          }
+          await this.database.call('updateWork', { work: media.work })
+          const authorIdFilled = !!media.work.authorId && !hadAuthorId
+          const coverFilled = !!media.work.coverUrl && !hadCover
+          const durationFilled = (media.work.durationMs ?? 0) > 0 && !hadDuration
+          const authorUrlFilled = !!media.work.authorUrl && !hadAuthorUrl
+          if (authorIdFilled || coverFilled || durationFilled || authorUrlFilled) {
+            task.updated++
+            this.libraryRevision++
+          } else {
+            task.failed++
+            recordMaintenanceFailure(failureReasons, '详情未提供可补齐的字段')
+            await this.logs.append(
+              'author-id-refresh.log',
+              `${new Date().toISOString()} 作品失败 ${index + 1}/${task.workIds.length}，作品 ${workId}，原因：详情未提供可补齐的字段。\n`
+            )
+          }
+          task.nextIndex = index + 1
+          task.pauseReason = null
+          await this.database.call('saveAuthorIdRefreshCheckpoint', { checkpoint: task })
+          progress.current = task.nextIndex
+          progress.updated = task.updated
+          progress.failed = task.failed
+          this.changed()
+        }
+        const stopped = this.authorIdRefreshStopRequested
+        const completed = task.nextIndex >= task.workIds.length
+        if (completed) {
+          await this.database.call('deleteAuthorIdRefreshCheckpoint', { accountId })
+        }
+        const result = {
+          total: task.workIds.length,
+          updated: task.updated,
+          failed: task.failed - failedBeforeRun,
+          failureReasons: maintenanceFailureReasons(failureReasons),
+          deferred: completed ? 0 : deferred || task.workIds.length - task.nextIndex,
+          needsVerification,
+          stopped
+        }
+        await this.logs.append(
+          'author-id-refresh.log',
+          `${new Date().toISOString()} ${stopped ? '手动停止' : result.deferred ? '稍后继续' : '补全结束'}：未补齐 ${result.failed + result.deferred} 条（失败 ${result.failed} 条，待处理 ${result.deferred} 条）；失败原因：${maintenanceFailureSummary(failureReasons)}。\n`
+        )
+        return result
+      })
+    } finally {
+      this.authorIdRefreshRunning = false
+      this.authorIdRefreshStopRequested = false
+      this.authorIdRefreshProgress = null
+      this.changed()
+    }
+  }
+  private stopMissingAuthorIds(accountId: string): null {
+    if (this.authorIdRefreshRunning && this.authorIdRefreshProgress?.accountId === accountId) {
+      this.authorIdRefreshStopRequested = true
+      this.authorIdRefreshProgress.stopping = true
+      this.changed()
+    }
+    return null
+  }
+  private async resetMissingAuthorIds(accountId: string): Promise<null> {
+    if (this.authorIdRefreshRunning)
+      throw new AppError('BUSY', '作者 ID 补全正在运行，请先停止后再清除断点。')
+    await this.active(accountId)
+    await this.database.call('deleteAuthorIdRefreshCheckpoint', { accountId })
+    this.authorIdRefreshProgress = null
+    this.changed()
+    return null
+  }
+  private async runBackground<T>(
+    accountId: string,
+    operation: (check: () => void) => Promise<T>
+  ): Promise<T> {
+    const epoch = this.epoch
+    const check = () => {
+      if (this.closing) throw new AppError('CLOSING', '应用正在退出，未发送新的请求。')
+      if (epoch !== this.epoch) throw new AppError('CANCELLED', '操作已停止，旧结果已丢弃。')
+    }
+    await this.exclusive(async () => {
+      check()
+      if (this.accountAction) throw new AppError('BUSY', '账号操作正在收口，请稍候。')
+      await this.active(accountId)
+      check()
+    })
+    const result = await operation(check)
+    check()
+    return result
   }
   private async guarded<T>(accountId: string, operation: (check: () => void) => Promise<T>): Promise<T> {
     const epoch = this.epoch
@@ -765,9 +1596,32 @@ export class Application {
   private async collectionAction(
     accountId: string,
     source: 'likes' | 'favorites',
-    action: 'top' | 'down' | 'stop' | 'folders'
+    action: 'top' | 'down' | 'stop' | 'folders' | 'rescan'
   ) {
     await this.active(accountId)
+    if (action === 'rescan') {
+      if (this.coverRefreshRunning || this.durationRefreshRunning || this.authorIdRefreshRunning)
+        throw new AppError('BUSY', '请先停止元数据补全任务，再重新扫描列表。')
+      if (this.collection.running || this.favorites.running || this.unlike.running)
+        throw new AppError('BUSY', '请先停止当前任务，再重新扫描列表。')
+      // A list rescan refreshes author IDs directly, so the old detail-scan
+      // checkpoint is stale. Clear it; the next detail run re-queries current data.
+      await this.database.call('deleteAuthorIdRefreshCheckpoint', { accountId })
+      this.authorIdRefreshProgress = null
+      this.changed()
+      if (source === 'favorites') {
+        await this.execute('favoritesStart', { accountId, mode: 'sync' })
+        return
+      }
+      await this.exclusive(async () => {
+        await this.active(accountId)
+        this.assertAvailable(accountId, ['likes'])
+        if (this.collection.running || this.favorites.running || this.unlike.running)
+          throw new AppError('BUSY', '请先停止其他采集或取消点赞 / 收藏任务。')
+        await this.collection.start(accountId, 'full')
+      })
+      return
+    }
     if (source === 'favorites') {
       if (action === 'stop') {
         const normal = await this.database.call('favoritesTask', { accountId }),
@@ -868,8 +1722,12 @@ export class Application {
         'favoriteSave',
         'favoriteCreateFolder',
         'favoriteFolderEditLocal',
+        'favoriteFolderRenameCloud',
+        'favoriteFolderDeleteCloud',
         'favoriteFolderRemoveWorks',
         'favoriteFolderMoveWorks',
+        'favoriteFolderUpdateWorks',
+        'favoriteFolderAddWorks',
         'aiClassifyFavorites',
         'aiSuggestFolders',
         'aiResumeClassification',
@@ -915,8 +1773,12 @@ export class Application {
         'favoriteCreateFolder',
         'favoriteFolderCreateLocal',
         'favoriteFolderEditLocal',
+        'favoriteFolderRenameCloud',
+        'favoriteFolderDeleteCloud',
         'favoriteFolderDeleteLocal',
         'favoriteFolderMoveWorks',
+        'favoriteFolderUpdateWorks',
+        'favoriteFolderAddWorks',
         'aiClassifyFavorites',
         'aiSuggestFolders',
         'aiResumeClassification',
@@ -957,11 +1819,8 @@ export class Application {
         clipboard.writeText(input.text)
         return null
       case 'openAuthorProfile':
-        try {
-          await shell.openExternal(`https://www.douyin.com/user/${input.authorId}`)
-        } catch {
-          throw new AppError('OPEN_BROWSER_FAILED', '无法打开作者主页，请稍后重试。')
-        }
+        await this.active(input.accountId)
+        await this.engine.openAuthorProfile(input.accountId, input.authorId, input.authorUrl)
         return null
       case 'copyDiagnostics': {
         const diagnostic = await this.execute('diagnostics', {})
@@ -982,7 +1841,7 @@ export class Application {
       }
       case 'openReleases':
         try {
-          await shell.openExternal('https://github.com/Hannah2227/douyin-favorite-MyLike/releases')
+          await shell.openExternal('https://github.com/hqing8156-prog/douyin-favorite-MyLike/releases')
         } catch {
           throw new AppError('OPEN_BROWSER_FAILED', '无法打开系统默认浏览器，请稍后重试。')
         }
@@ -1206,7 +2065,46 @@ export class Application {
       case 'favoriteFolderEditLocal':
         await this.active(input.accountId)
         await this.favorites.pause()
-        return this.favoriteActions.renameFolder(input.accountId, input.folderId, input.title)
+        {
+          const result = await this.favoriteActions.renameFolder(input.accountId, input.folderId, input.title)
+          this.libraryRevision++
+          return result
+        }
+      case 'favoriteFolderRenameCloud':
+        await this.active(input.accountId)
+        this.assertAvailable(input.accountId, ['favoriteFolderCreate'])
+        await this.favorites.pause()
+        {
+          let result
+          try {
+            result = await this.favoriteActions.renameCloudFolder(
+              input.accountId,
+              input.folderId,
+              input.title
+            )
+          } catch (error) {
+            if (error instanceof AppError && error.code === 'WRITE_UNCONFIRMED')
+              this.record(input.accountId, {
+                kind: 'request',
+                operation: 'favoriteFolderRenameCloud',
+                message: '云端收藏夹改名未获成功确认。',
+                responseType: 'api-error',
+                code: error.code
+              })
+            throw error
+          }
+          this.libraryRevision++
+          return result
+        }
+      case 'favoriteFolderDeleteCloud':
+        await this.active(input.accountId)
+        this.assertAvailable(input.accountId, ['favoriteFolderCreate'])
+        await this.favorites.pause()
+        {
+          const result = await this.favoriteActions.deleteCloudFolder(input.accountId, input.folderId)
+          this.libraryRevision++
+          return result
+        }
       case 'favoriteFolderDeleteLocal':
         await this.active(input.accountId)
         {
@@ -1255,7 +2153,7 @@ export class Application {
           this.favoriteSyncLast = {
             accountId: input.accountId,
             status: this.favoriteSyncStopRequested ? 'stopped' : 'completed',
-            message: null,
+            message: result.skipped ? `跳过 ${result.skipped} 个不可用作品，详情见本地写回日志` : null,
             at: Date.now()
           }
           return result
@@ -1335,26 +2233,64 @@ export class Application {
           input.workIds
         )
       }
+      case 'favoriteFolderUpdateWorks': {
+        await this.active(input.accountId)
+        await Promise.all([this.collection.pause(), this.favorites.pause()])
+        await this.favoriteActions.idle()
+        await this.lane.idle()
+        if (this.collection.running || this.favorites.running || this.unlike.running)
+          throw new AppError('BUSY', '请先停止其他采集或取消点赞 / 收藏任务，再更新收藏夹内容。')
+        return this.favoriteActions.updateFolderMemberships(
+          input.accountId,
+          input.fromFolderId,
+          input.addFolderIds,
+          input.removeFolderIds,
+          input.workIds
+        )
+      }
+      case 'favoriteFolderAddWorks':
+        await this.active(input.accountId)
+        await Promise.all([this.collection.pause(), this.favorites.pause()])
+        await this.favoriteActions.idle()
+        await this.lane.idle()
+        if (this.collection.running || this.favorites.running || this.unlike.running)
+          throw new AppError('BUSY', '请先停止其他采集或取消点赞 / 收藏任务，再添加到收藏夹。')
+        return this.favoriteActions.addToFolders(input.accountId, input.addFolderIds, input.workIds)
       case 'favoriteStatus':
         await this.active(input.accountId)
         return this.database.call('favoriteStatus', input)
       case 'favoriteEditor':
         await this.active(input.accountId)
-        this.assertAvailable(input.accountId, ['detail', 'folders'])
-        return this.favoriteActions.open(input)
+        {
+          const preferences = await this.database.call('appPreferences', {})
+          if (preferences.syncFavoritesToCloud) this.assertAvailable(input.accountId, ['detail', 'folders'])
+        }
+        return this.favoriteActions.open(input, input.refresh)
       case 'favoriteSave':
         await this.active(input.accountId)
-        this.assertAvailable(input.accountId, ['detail', 'folders'])
+        {
+          const preferences = await this.database.call('appPreferences', {})
+          if (preferences.syncFavoritesToCloud)
+            this.assertAvailable(input.accountId, ['detail', 'folders', 'favoriteFolderRemove'])
+          else if (input.removeFolderIds.length)
+            this.assertAvailable(input.accountId, ['favoriteFolderRemove'])
+        }
         await this.favorites.pause()
-        return this.favoriteActions.save(input.accountId, input.token, input.folderIds)
+        return this.favoriteActions.save(input.accountId, input.token, input.folderIds, input.removeFolderIds)
       case 'favoriteCreateFolder':
         await this.active(input.accountId)
-        this.assertAvailable(input.accountId, ['favoriteFolderCreate'])
+        {
+          const preferences = await this.database.call('appPreferences', {})
+          if (preferences.syncFavoritesToCloud)
+            this.assertAvailable(input.accountId, ['favoriteFolderCreate'])
+        }
         await this.favorites.pause()
         return this.favoriteActions.createFolder(input.accountId, input.token, input.name, input.private)
       case 'aiClassifyFavorites':
         await this.active(input.accountId)
         await this.favorites.pause()
+        if (this.aiClassification?.status === 'running')
+          throw new AppError('BUSY', 'AI 分类正在运行，请等待当前分类完成。')
         return this.aiClassifier.runClassification(input.accountId, {
           folderIds: input.folderIds,
           createAiFolders: input.createAiFolders,
@@ -1382,143 +2318,20 @@ export class Application {
             createMissingFolders: input.createMissingFolders
           })
         )
-      case 'scanTextWorks':
-        return this.run(input.accountId, async (check) => {
-          await this.favorites.pause()
-          await this.collection.pause()
-          await this.identity(input.accountId, check)
-          this.record(input.accountId, {
-            kind: 'task',
-            operation: 'textScan',
-            message: `开始扫描${input.source === 'likes' ? '喜欢' : '收藏'}内容中的文字作品。`
-          })
-          const works: import('../shared/contracts').Work[] = []
-          const seen = new Set<string>()
-          for (let offset = 0; ; offset += 120) {
-            check()
-            const page = await this.database.call('query', {
-              accountId: input.accountId,
-              source: input.source,
-              folderId: null,
-              search: '',
-              mediaType: 'all',
-              year: null,
-              month: null,
-              sort: 'collected',
-              offset,
-              limit: 120
-            })
-            for (const work of page.items) {
-              if (!seen.has(work.id)) {
-                seen.add(work.id)
-                works.push(work)
-              }
-            }
-            if (!page.items.length || works.length >= page.total) break
-          }
-          this.textScan = {
-            accountId: input.accountId,
-            source: input.source,
-            current: 0,
-            total: works.length,
-            startedAt: Date.now()
-          }
-          this.changed()
-          let text = 0
-          let addedText = 0
-          let succeeded = 0
-          let failed = 0
-          let deferred = 0
-          for (const [index, work] of works.entries()) {
-            try {
-              check()
-              const media = parseMedia(
-                await this.engine.request(input.accountId, 'detail', {
-                  aweme_id: work.id,
-                  publish_video_strategy_type: '2',
-                  pc_client_type: '1'
-                })
-              )
-              check()
-              if (media.work.id !== work.id)
-                throw new AppError('INVALID_RESPONSE', '作品详情与请求目标不一致。')
-              await this.database.call('updateWork', { work: media.work })
-              succeeded++
-              if (media.work.mediaType === 'text') text++
-              if (work.mediaType !== 'text' && media.work.mediaType === 'text') addedText++
-              if ((index + 1) % 10 === 0 || index + 1 === works.length)
-                this.record(input.accountId, {
-                  kind: 'task',
-                  operation: 'textScan',
-                  message: `扫描进度：${index + 1}/${works.length}，已识别文字 ${text} 条。`,
-                  count: text
-                })
-            } catch (error) {
-              if (error instanceof AppError && error.code === 'CANCELLED') throw error
-              if (
-                error instanceof AppError &&
-                ['RATE_LIMITED', 'UPSTREAM_RISK_CONTROL', 'AUTH_REQUIRED', 'VERIFICATION_REQUIRED'].includes(
-                  error.code
-                )
-              ) {
-                deferred = works.length - index
-                this.textScan = {
-                  accountId: input.accountId,
-                  source: input.source,
-                  current: index,
-                  total: works.length,
-                  startedAt: this.textScan?.startedAt ?? Date.now()
-                }
-                this.changed()
-                this.record(input.accountId, {
-                  kind: 'task',
-                  operation: 'textScan',
-                  message: `平台暂时限制详情读取，已完成 ${index} 条，剩余 ${deferred} 条待稍后继续。`,
-                  code: error.code
-                })
-                break
-              }
-              failed++
-              if (error instanceof AppError && error.code === 'EMPTY_RESPONSE') {
-                this.record(input.accountId, {
-                  kind: 'task',
-                  operation: 'textScan',
-                  message: `作品 ${work.id} 返回空响应，已跳过，不会重试。`,
-                  code: error.code
-                })
-                continue
-              }
-              console.error(`[MyLike] 文字扫描失败：${work.id}`, error)
-              this.record(input.accountId, {
-                kind: 'task',
-                operation: 'textScan',
-                message: `作品 ${work.id} 扫描失败：${error instanceof Error ? error.message : String(error)}`,
-                code: 'TEXT_SCAN_FAILED'
-              })
-            }
-            this.textScan = {
-              accountId: input.accountId,
-              source: input.source,
-              current: index + 1,
-              total: works.length,
-              startedAt: this.textScan?.startedAt ?? Date.now()
-            }
-            if ((index + 1) % 10 === 0 || index + 1 === works.length || index === 0) this.changed()
-          }
-          this.record(input.accountId, {
-            kind: 'task',
-            operation: 'textScan',
-            message: `扫描结束：尝试 ${succeeded + failed} 条，扫描成功 ${succeeded} 条，扫描失败 ${failed} 条，待稍后扫描 ${deferred} 条，识别文字 ${text} 条，新增文字 ${addedText} 条。`,
-            code: 'END_CONFIRMED',
-            count: text
-          })
-          this.libraryRevision++
-          this.changed()
-          return { scanned: succeeded + failed, succeeded, text, addedText, failed, deferred }
-        }).finally(() => {
-          this.textScan = null
-          this.changed()
-        })
+      case 'fetchMissingCovers':
+        return this.fetchMissingCovers(input.accountId)
+      case 'stopMissingCovers':
+        return this.stopMissingCovers(input.accountId)
+      case 'syncVideoDurations':
+        return this.syncVideoDurations(input.accountId)
+      case 'stopVideoDurationSync':
+        return this.stopVideoDurationSync(input.accountId)
+      case 'syncMissingAuthorIds':
+        return this.syncMissingAuthorIds(input.accountId)
+      case 'stopMissingAuthorIds':
+        return this.stopMissingAuthorIds(input.accountId)
+      case 'resetMissingAuthorIds':
+        return this.resetMissingAuthorIds(input.accountId)
       case 'aiTestConnection':
         return this.aiClassifier.testConnection(input.provider)
       case 'favoritesStart':
@@ -1723,6 +2536,8 @@ export class Application {
         return this.maintenance.info()
       case 'openDataFolder':
         return this.maintenance.open(input.target)
+      case 'openLogFile':
+        return this.maintenance.openLog(input.name)
       case 'pickCoverCacheDirectory': {
         const options = {
           title: '选择封面缓存目录',
@@ -1846,7 +2661,7 @@ export class Application {
         return null
       case 'openProject':
         try {
-          await shell.openExternal('https://github.com/Hannah2227/douyin-favorite-MyLike')
+          await shell.openExternal('https://github.com/hqing8156-prog/douyin-favorite-MyLike')
         } catch {
           throw new AppError('OPEN_BROWSER_FAILED', '无法打开系统默认浏览器，请检查默认浏览器设置后重试。')
         }

@@ -5,7 +5,8 @@ export class AppError extends Error {
     public readonly code: string,
     message: string,
     public readonly rule?: ResponseRule,
-    public readonly retryAt?: number
+    public readonly retryAt?: number,
+    public readonly diagnostic?: string
   ) {
     super(message)
   }

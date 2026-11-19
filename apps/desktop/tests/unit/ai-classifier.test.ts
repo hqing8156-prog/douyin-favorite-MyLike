@@ -7,7 +7,8 @@ import {
   normalizeAssignments,
   parseClassificationLog,
   parseFolderNameSuggestions,
-  parseModelAssignments
+  parseModelAssignments,
+  parseVideoDescriptions
 } from '../../src/main/ai-classifier'
 import type { Database } from '../../src/main/storage/client'
 import { Store } from '../../src/main/storage/database'
@@ -71,6 +72,23 @@ it('parses unique AI folder name suggestions and removes an AI prefix', () => {
     '旅行',
     '美食'
   ])
+})
+
+it('parses one visual description per requested video and ignores unknown references', () => {
+  expect(
+    parseVideoDescriptions(
+      '{"descriptions":[{"workId":"W1","description":"室内打羽毛球"},{"workId":"W2","description":"海边日落"},{"workId":"W99","description":"忽略"}]}',
+      new Set(['W1', 'W2'])
+    )
+  ).toEqual(
+    new Map([
+      ['W1', '室内打羽毛球'],
+      ['W2', '海边日落']
+    ])
+  )
+  expect(() => parseVideoDescriptions('{"descriptions":[]}', new Set(['W1']))).toThrow(
+    '未能为全部视频返回画面描述'
+  )
 })
 
 it('creates private AI folders and records the same work in each assigned folder', async () => {
@@ -206,6 +224,7 @@ it('creates private AI folders and records the same work in each assigned folder
     }
   }
   const progress: { phase: string; current: number; total: number; status: string }[] = []
+  let backgroundRuns = 0
   const classifier = new AiClassifier(
     database,
     engine,
@@ -213,7 +232,12 @@ it('creates private AI folders and records the same work in each assigned folder
     async () => store.call('accounts', undefined).find((account) => account.id === 'a')!,
     () => {},
     undefined,
-    (state) => progress.push(state)
+    (state) => progress.push(state),
+    undefined,
+    async (_accountId, action) => {
+      backgroundRuns++
+      return action(() => {})
+    }
   )
 
   await expect(
@@ -233,6 +257,7 @@ it('creates private AI folders and records the same work in each assigned folder
       { title: 'AI-创意-回忆', count: 2 }
     ]
   })
+  expect(backgroundRuns).toBe(1)
   expect(classificationRules[0]).toContain('羽毛球、篮球、乒乓球、一般健身')
   expect(classificationRules[0]).toContain('categories 必须返回空数组')
   expect(requests.some((request) => request.operation === 'favoriteFolderCreate')).toBe(false)
@@ -390,6 +415,56 @@ it('creates private AI folders and records the same work in each assigned folder
     folderCounts: []
   })
   expect(requests.filter((request) => request.operation === 'favoriteFolderCreate')).toHaveLength(0)
+
+  const longCaption = {
+    ...work,
+    id: '1234567890123456792',
+    title: '长'.repeat(201),
+    mediaType: 'text' as const
+  }
+  const boundaryCaption = {
+    ...work,
+    id: '1234567890123456793',
+    title: '文'.repeat(200),
+    mediaType: 'text' as const
+  }
+  store.call('favoriteConfirm', { accountId: 'a', remoteId: 'remote-a', work: longCaption })
+  store.call('favoriteConfirm', { accountId: 'a', remoteId: 'remote-a', work: boundaryCaption })
+  await expect(
+    classifier.runClassification('a', {
+      folderIds: [],
+      createAiFolders: false,
+      aiFolderNames: []
+    })
+  ).resolves.toMatchObject({
+    classified: 1,
+    failed: 0,
+    foldersCreated: 1,
+    foldersUsed: 1,
+    unmatched: 4,
+    folderCounts: [{ title: '文学', count: 1 }]
+  })
+  const literatureFolder = store
+    .call('favoriteFolders', { accountId: 'a' })
+    .find((folder) => folder.title === '文学')
+  if (!literatureFolder) throw new Error('自动归档未创建文学收藏夹。')
+  expect(literatureFolder).toMatchObject({ localOnly: true, localCount: 1 })
+  expect(
+    store
+      .call('query', {
+        accountId: 'a',
+        source: 'favorites',
+        folderId: literatureFolder!.id,
+        search: '',
+        mediaType: 'all',
+        year: null,
+        month: null,
+        sort: 'collected',
+        offset: 0,
+        limit: 60
+      })
+      .items.map((item) => item.id)
+  ).toEqual([longCaption.id])
 })
 
 it('records the AI phase when the identity request fails, even though standalone self failures are filtered', async () => {
@@ -438,6 +513,44 @@ it('records the AI phase when the identity request fails, even though standalone
   expect(runtimeEventCategory(events[0]!)).toBe('exception')
 })
 
+it('retains the provider reason for an AI access rejection in task diagnostics', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'mylike-ai-classifier-'))
+  roots.push(root)
+  const store = new Store(join(root, 'db.sqlite'))
+  stores.push(store)
+  store.call('createAccount', { id: 'a', name: '账号 A' })
+  store.call('bindAccount', {
+    accountId: 'a',
+    remoteId: 'remote-a',
+    nickname: '账号 A',
+    avatarUrl: null
+  })
+  store.call('appPreferences', {
+    preferences: { deepseekApiKey: 'test-key', siliconFlowApiKey: 'test-key' }
+  })
+  const providerReason = 'SiliconFlow 拒绝了当前请求（HTTP 403）。服务说明：Model disabled.'
+  const events: RuntimeEventInput[] = []
+  const classifier = new AiClassifier(
+    { call: async (method, input) => store.call(method, input) } as Database,
+    {
+      async request() {
+        throw new Error('Unexpected Douyin request')
+      }
+    } as Pick<DouyinEngine, 'request'>,
+    async (_accountId, action) => action(() => {}),
+    async () => {
+      throw new AppError('AI_ACCESS_REJECTED', providerReason)
+    },
+    () => {},
+    (_accountId, event) => events.push(event)
+  )
+
+  await expect(classifier.runClassification('a')).rejects.toMatchObject({
+    code: 'AI_ACCESS_REJECTED'
+  })
+  expect(events[0]?.message).toContain(`服务反馈：${providerReason}`)
+})
+
 it('reports a missing DeepSeek key as an AI configuration issue, not a Douyin login issue', async () => {
   const root = mkdtempSync(join(tmpdir(), 'mylike-ai-classifier-'))
   roots.push(root)
@@ -469,7 +582,7 @@ it('reports a missing DeepSeek key as an AI configuration issue, not a Douyin lo
   expect(events[0]).toMatchObject({
     operation: 'aiClassify',
     code: 'AI_DEEPSEEK_KEY_REQUIRED',
-    message: 'AI 自动分类在“读取设置”阶段失败。'
+    message: 'AI 自动分类在“读取本地收藏”阶段失败。'
   })
   expect(runtimeEventCategory(events[0]!)).toBe('exception')
 })
@@ -527,6 +640,147 @@ it('requires SiliconFlow only when a short-title video needs transcription', asy
     code: 'AI_SILICONFLOW_KEY_REQUIRED'
   })
 })
+
+it('classifies the rest of the batch when one video cannot be inspected', async () => {
+  const { classifier, store, logs } = await setupVideoClassification()
+  vi.stubGlobal(
+    'fetch',
+    vi.fn(
+      async () =>
+        new Response(
+          JSON.stringify({
+            choices: [{ message: { content: '{"assignments":[{"workId":"W1","categories":["F1"]}]}' } }]
+          }),
+          { status: 200 }
+        )
+    )
+  )
+  vi.spyOn(
+    classifier as unknown as { extractVideoFrames: () => Promise<Buffer[]> },
+    'extractVideoFrames'
+  ).mockRejectedValue(new AppError('AI_VIDEO_TOO_LARGE', '视频文件超过 512 MB，已跳过画面识别。'))
+
+  await expect(
+    classifier.runClassification('a', {
+      folderIds: [],
+      createAiFolders: true,
+      aiFolderNames: ['AI-其他']
+    })
+  ).resolves.toMatchObject({
+    classified: 1,
+    failed: 0,
+    foldersCreated: 1,
+    foldersUsed: 1,
+    folderCounts: [{ title: 'AI-其他', count: 1 }]
+  })
+  expect(logs.some((line) => line.includes('跳过视频画面'))).toBe(true)
+  expect(logs.some((line) => line.includes('已按标题和作者继续分类'))).toBe(true)
+  expect(store.call('favoriteFolders', { accountId: 'a' })).toMatchObject([
+    { title: 'AI-其他', localCount: 1 }
+  ])
+})
+
+it('still aborts when the video toolchain itself is unavailable', async () => {
+  const { classifier } = await setupVideoClassification()
+  vi.spyOn(
+    classifier as unknown as { extractVideoFrames: () => Promise<Buffer[]> },
+    'extractVideoFrames'
+  ).mockRejectedValue(
+    new AppError('AI_FFMPEG_REQUIRED', '视频画面识别需要在电脑上安装 FFmpeg，并确保 ffmpeg 命令可用。')
+  )
+
+  await expect(
+    classifier.runClassification('a', {
+      folderIds: [],
+      createAiFolders: true,
+      aiFolderNames: ['AI-其他']
+    })
+  ).rejects.toMatchObject({ code: 'AI_FFMPEG_REQUIRED' })
+})
+
+it('skips frame recognition entirely when the setting is off', async () => {
+  const { classifier } = await setupVideoClassification({ aiVideoInspection: false })
+  vi.stubGlobal(
+    'fetch',
+    vi.fn(
+      async () =>
+        new Response(
+          JSON.stringify({
+            choices: [{ message: { content: '{"assignments":[{"workId":"W1","categories":["F1"]}]}' } }]
+          }),
+          { status: 200 }
+        )
+    )
+  )
+  const extract = vi.spyOn(
+    classifier as unknown as { extractVideoFrames: () => Promise<Buffer[]> },
+    'extractVideoFrames'
+  )
+
+  await expect(
+    classifier.runClassification('a', {
+      folderIds: [],
+      createAiFolders: true,
+      aiFolderNames: ['AI-其他']
+    })
+  ).resolves.toMatchObject({ classified: 1, folderCounts: [{ title: 'AI-其他', count: 1 }] })
+  expect(extract).not.toHaveBeenCalled()
+})
+
+async function setupVideoClassification(preferenceOverrides: Record<string, unknown> = {}): Promise<{
+  classifier: AiClassifier
+  store: Store
+  logs: string[]
+}> {
+  const root = mkdtempSync(join(tmpdir(), 'mylike-ai-classifier-'))
+  roots.push(root)
+  const store = new Store(join(root, 'db.sqlite'))
+  stores.push(store)
+  store.call('createAccount', { id: 'a', name: '账号 A' })
+  store.call('bindAccount', {
+    accountId: 'a',
+    remoteId: 'remote-a',
+    nickname: '账号 A',
+    avatarUrl: null
+  })
+  store.call('appPreferences', {
+    preferences: {
+      deepseekApiKey: 'test-key',
+      siliconFlowApiKey: 'test-key',
+      ...preferenceOverrides
+    }
+  })
+  store.call('favoriteConfirm', {
+    accountId: 'a',
+    remoteId: 'remote-a',
+    work: {
+      id: '1234567890123456789',
+      title: '旅行记录',
+      author: '作者',
+      publishedAt: 1,
+      coverUrl: null,
+      mediaType: 'video',
+      isLive: false
+    }
+  })
+  const logs: string[] = []
+  const classifier = new AiClassifier(
+    { call: async (method, input) => store.call(method, input) } as Database,
+    {
+      async request(_accountId, operation) {
+        if (operation === 'folders') return { status_code: 0, collects_list: [], has_more: 0, cursor: '0' }
+        throw new Error('Unexpected Douyin request')
+      }
+    } as Pick<DouyinEngine, 'request'>,
+    async (_accountId, action) => action(() => {}),
+    async () => store.call('accounts', undefined).find((account) => account.id === 'a')!,
+    () => {},
+    undefined,
+    undefined,
+    (line) => logs.push(line)
+  )
+  return { classifier, store, logs }
+}
 
 it('records AI network failures without exposing the underlying exception', async () => {
   const root = mkdtempSync(join(tmpdir(), 'mylike-ai-classifier-'))
@@ -608,8 +862,7 @@ it('tests the saved provider key and reports a clear result for success or HTTP 
     {
       call: async () => ({
         deepseekApiKey: 'saved-deepseek-key',
-        siliconFlowApiKey: '',
-        favoriteCategoryHints: ''
+        siliconFlowApiKey: ''
       })
     } as Pick<Database, 'call'>,
     {
@@ -637,6 +890,42 @@ it('tests the saved provider key and reports a clear result for success or HTTP 
     vi.fn(async () => new Response('{}', { status: 200 }))
   )
   await expect(classifier.testConnection('deepseek')).resolves.toBeNull()
+})
+
+it('explains SiliconFlow HTTP 403 as a model or account permission failure', async () => {
+  vi.stubGlobal(
+    'fetch',
+    vi.fn(
+      async () =>
+        new Response(JSON.stringify({ message: '当前模型无调用权限。siliconflow-test-key' }), {
+          status: 403
+        })
+    )
+  )
+  const classifier = new AiClassifier(
+    {
+      call: async () => ({
+        deepseekApiKey: '',
+        siliconFlowApiKey: 'siliconflow-test-key'
+      })
+    } as Pick<Database, 'call'>,
+    {
+      async request() {
+        throw new Error('Unexpected Douyin request')
+      }
+    } as Pick<DouyinEngine, 'request'>,
+    async (_accountId, action) => action(() => {}),
+    async () => {
+      throw new Error('Unexpected identity request')
+    },
+    () => {}
+  )
+
+  await expect(classifier.testConnection('siliconflow')).rejects.toMatchObject({
+    code: 'AI_ACCESS_REJECTED',
+    message:
+      'SiliconFlow 拒绝了当前请求（HTTP 403）。请检查账户状态、模型调用权限或额度。 服务说明：当前模型无调用权限。[已隐藏]'
+  })
 })
 
 it('reports malformed model output as an AI response error, not a Douyin API error', async () => {

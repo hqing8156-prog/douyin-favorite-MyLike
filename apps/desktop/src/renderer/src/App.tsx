@@ -22,6 +22,7 @@ import { useOverview } from './useOverview'
 import { HelpPage } from './HelpPage'
 import { AiClassifyDialog, type AiClassificationSource } from './AiClassifyDialog'
 import { MoveToFolderDialog } from './MoveToFolderDialog'
+import { QueuePanel } from './QueuePanel'
 
 export function App() {
   const [snapshot, setSnapshot] = useState<Snapshot | null>(null)
@@ -34,6 +35,10 @@ export function App() {
   const [classificationSource, setClassificationSource] = useState<AiClassificationSource | null>(null)
   const [adding, setAdding] = useState(false)
   const [queueOpen, setQueueOpen] = useState(false)
+  // The queue panel lives beside the keyed Player so its list never remounts on a work switch.
+  const queueJump = useRef<(index: number) => void>(() => {})
+  const [commentsOpen, setCommentsOpen] = useState(false)
+  const [favoriteOpen, setFavoriteOpen] = useState(false)
   const [name, setName] = useState('')
   const [diagnostics, setDiagnostics] = useState<Diagnostics | null>(null)
   const [deleteTarget, setDeleteTarget] = useState<{ accountId: string; ids: string[] } | null>(null)
@@ -79,6 +84,13 @@ export function App() {
     { source: 'favorites', folderId }
   )
   const favoriteFolders = useFavoriteFolders(accountId, revision, setError)
+  useEffect(() => {
+    // Visiting the favorites page re-checks which linked folders still exist
+    // in the cloud. The result only annotates the cached list; nothing is
+    // deleted and failures fall back to the cache.
+    if (tab !== 'favorites' || !accountId) return
+    void favoriteFolders.reconcile()
+  }, [tab, accountId, favoriteFolders.reconcile])
   const library = tab === 'favorites' ? favoritesLibrary : likesLibrary
   useEffect(() => {
     setFolderId(null)
@@ -95,6 +107,19 @@ export function App() {
     )
       setFolderId(null)
   }, [favoriteFolders.loaded, favoriteFolders.folders, folderId])
+  // Panel state lives here so it survives the Player remount on every work switch.
+  // Each preference decides whether the last open/closed state carries to the next
+  // work; without it reset during render so the next work never flashes the panel.
+  const [panelScope, setPanelScope] = useState('')
+  if (panelScope !== playback.key) {
+    const started = !panelScope
+    setPanelScope(playback.key)
+    if (!playback.key || !preferences.value.keepCommentsPanel) setCommentsOpen(false)
+    if (!playback.key || !preferences.value.keepFavoritePanel) setFavoriteOpen(false)
+    // The persisted bar opens with the player so saving a work does not leave
+    // the next work without it; a manual close still carries across works.
+    else if (started) setFavoriteOpen(true)
+  }
   const startFavorites = () =>
     accountId &&
     void perform('向下采集', () =>
@@ -534,7 +559,7 @@ export function App() {
       </main>
       <div
         ref={presentation.frame}
-        className={`player-shell${playback.view && !presentation.leaving ? ' is-active' : ''}`}
+        className={`player-shell${playback.view && !presentation.leaving ? ' is-active' : ''}${presentation.clean ? ' is-clean' : ''}`}
         inert={!playback.view || presentation.leaving}
         aria-hidden={!playback.view || presentation.leaving}
       >
@@ -571,6 +596,19 @@ export function App() {
             }}
             queueOpen={queueOpen}
             setQueueOpen={setQueueOpen}
+            queueJump={queueJump}
+            commentsOpen={commentsOpen}
+            setCommentsOpen={setCommentsOpen}
+            favoriteOpen={favoriteOpen}
+            setFavoriteOpen={setFavoriteOpen}
+          />
+        )}
+        {playback.view && queueOpen && (
+          <QueuePanel
+            queue={playback.view.queue}
+            side={preferences.value.queuePanelSide}
+            jump={(index) => queueJump.current(index)}
+            close={() => setQueueOpen(false)}
           />
         )}
       </div>

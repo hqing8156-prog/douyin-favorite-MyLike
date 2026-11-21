@@ -6,6 +6,7 @@
   --accent: #ff2b58;
   color: var(--text);
   position: fixed;
+  z-index: 20;
   inset: auto 18px 65px auto;
   margin: 0;
   width: min(380px, calc(100vw - 36px));
@@ -324,25 +325,6 @@
 }
 .favorite-move-dialog .favorite-folder-list {
   max-height: min(360px, calc(100dvh - 320px));
-}
-.favorite-move-create-form > label:first-child {
-  display: block;
-  margin-bottom: 6px;
-  color: #b6b6c2;
-  font-size: 12px;
-}
-.favorite-move-create-form > input {
-  box-sizing: border-box;
-  min-height: 38px;
-  padding: 8px 10px;
-  border: 1px solid #ffffff20;
-  border-radius: 8px;
-}
-.favorite-move-create-form > div {
-  justify-content: flex-end;
-}
-.favorite-move-create-form > div > label {
-  margin-right: auto;
 }
 
 .favorite-writeback-dialog .favorite-folder-list {

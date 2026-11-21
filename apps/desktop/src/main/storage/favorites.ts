@@ -300,6 +300,65 @@ export class FavoritesStore {
       return result
     })
   }
+  /**
+   * Aligns the local folder list with the cloud listing the caller just read.
+   * A linked folder the platform no longer has is dropped when nothing local
+   * depends on it, or converted to a local-only folder otherwise so its works
+   * stay and a later writeback recreates the cloud folder. Sync jobs are left
+   * alone: the folder-list stage of the next sync prunes orphans, and deleting
+   * them here could strand a paused task's current folder.
+   */
+  reconcileFolders(input: { accountId: string; liveRemoteIds: string[] }): {
+    removed: number
+    unlinked: number
+  } {
+    return this.transaction(() => {
+      const live = new Set(input.liveRemoteIds)
+      let removed = 0
+      let unlinked = 0
+      for (const folder of this.folders(input.accountId)) {
+        if (folder.localOnly || !folder.remoteId || live.has(folder.remoteId)) continue
+        if (folder.localCount === 0 && (folder.pendingWrites ?? 0) === 0) {
+          this.removeFolderRecord(input.accountId, folder)
+          removed++
+        } else {
+          this.unlinkFolderRecord(input.accountId, folder)
+          unlinked++
+        }
+      }
+      return { removed, unlinked }
+    })
+  }
+  private removeFolderRecord(accountId: string, folder: FavoriteFolder): void {
+    for (const table of ['favorite_write_ops', 'favorite_folder_overrides', 'favorite_member_overrides'])
+      this.db.prepare(`DELETE FROM ${table} WHERE accountId=? AND folderId=?`).run(accountId, folder.id)
+    this.db
+      .prepare('DELETE FROM favorite_folder_links WHERE accountId=? AND localId=?')
+      .run(accountId, folder.id)
+    // Deleting the folder row cascades saved_members and saved_scan_members.
+    this.db.prepare('DELETE FROM saved_folders WHERE accountId=? AND id=?').run(accountId, folder.id)
+  }
+  private unlinkFolderRecord(accountId: string, folder: FavoriteFolder): void {
+    // Keep the local works; the folder is now local-only (no cloud icon) and
+    // the next writeback creates a fresh cloud folder with the same title.
+    this.db
+      .prepare(
+        'UPDATE favorite_folder_links SET localOnly=1,remoteId=NULL,managedLocally=1 WHERE accountId=? AND localId=?'
+      )
+      .run(accountId, folder.id)
+    this.db
+      .prepare('UPDATE saved_folders SET remoteCount=0 WHERE accountId=? AND id=?')
+      .run(accountId, folder.id)
+    // Member writes queued for the dead cloud folder would run before the
+    // fresh folder-create that the next writeback stages, and fail with
+    // FOLDER_UNSYNCED. Drop them; staging re-queues every local member after
+    // the create.
+    this.db
+      .prepare(
+        "DELETE FROM favorite_write_ops WHERE accountId=? AND folderId=? AND kind IN ('folder-add','folder-remove')"
+      )
+      .run(accountId, folder.id)
+  }
   localFolderDelete(input: { accountId: string; folderId: string }): {
     folderId: string
     title: string

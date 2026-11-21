@@ -58,3 +58,15 @@ export function sortFavoriteFoldersByVisit(
     (a, b) => (visits[b.id] ?? 0) - (visits[a.id] ?? 0) || a.title.localeCompare(b.title, 'zh-CN')
   )
 }
+
+/** Folders already containing the selected works come first, each group in visit order. */
+export function sortFavoriteFoldersForSelection(
+  folders: FavoriteFolder[],
+  visits: Record<string, number>,
+  existingCounts: Record<string, number> | null
+): FavoriteFolder[] {
+  const ordered = sortFavoriteFoldersByVisit(folders, visits)
+  if (!existingCounts) return ordered
+  const existing = (folder: FavoriteFolder) => (existingCounts[folder.id] ?? 0) > 0
+  return [...ordered.filter(existing), ...ordered.filter((folder) => !existing(folder))]
+}

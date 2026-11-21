@@ -14,6 +14,7 @@ export type Operation =
   | 'folderItems'
   | 'comments'
   | 'commentReplies'
+  | 'danmaku'
   | WriteOperation
 export function isWriteOperation(operation: Operation): operation is WriteOperation {
   return [
@@ -41,6 +42,7 @@ async function requestInPage(request: PageRequest) {
     detail: '/aweme/v1/web/aweme/detail/',
     comments: '/aweme/v1/web/comment/list/',
     commentReplies: '/aweme/v1/web/comment/list/reply/',
+    danmaku: '/aweme/v1/web/danmaku/get_v2/',
     unlike: '/aweme/v1/web/commit/item/digg/',
     favorites: '/aweme/v1/web/aweme/listcollection/',
     folders: '/aweme/v1/web/collects/list/',
@@ -129,11 +131,16 @@ async function requestInPage(request: PageRequest) {
   })
   const collection = ['favorites', 'folders', 'folderItems'].includes(request.operation)
   const commentRead = request.operation === 'comments' || request.operation === 'commentReplies'
+  const danmakuRead = request.operation === 'danmaku'
   const referrer = collection
     ? 'https://www.douyin.com/user/self?from_tab_name=main&showTab=favorite_collection'
-    : commentRead
-      ? 'https://www.douyin.com/video/' + (request.parameters.aweme_id ?? request.parameters.item_id)
+    : commentRead || danmakuRead
+      ? 'https://www.douyin.com/video/' + (request.parameters.aweme_id ?? request.parameters.item_id ?? '')
       : undefined
+  if (danmakuRead) {
+    params.set('app_name', 'aweme')
+    params.set('format', 'json')
+  }
   if (collection || commentRead) {
     if (request.operation !== 'favorites' && !params.has('count')) params.set('count', '20')
     params.set('pc_client_type', '1')
@@ -181,7 +188,13 @@ async function requestInPage(request: PageRequest) {
   try {
     // Match the original page-SDK request: use only the current page's token,
     // never a fabricated or persisted signing value.
-    if (request.operation === 'likes' || request.operation === 'detail' || collection || commentRead) {
+    if (
+      request.operation === 'likes' ||
+      request.operation === 'detail' ||
+      collection ||
+      commentRead ||
+      danmakuRead
+    ) {
       try {
         const token = document.cookie.match(/(?:^|;\s*)msToken=([^;]+)/)?.[1]
         if (token) {

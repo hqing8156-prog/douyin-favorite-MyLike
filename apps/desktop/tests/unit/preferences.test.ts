@@ -48,7 +48,7 @@ it('preserves legacy custom keys when newly introduced defaults would conflict',
   expect(value).toMatchObject({
     volume: 0.3,
     autoplay: true,
-    seekStep: 10,
+    seekStep: 1,
     shortcuts: { playPause: 'KeyL', previous: 'KeyM', next: 'ArrowDown', queue: 'KeyQ', mute: 'KeyN' }
   })
   expect(() =>
@@ -98,6 +98,20 @@ it('adds clean screen to the focused shortcuts, upgrades defaults and preserves 
     readPlaybackPreferences({ shortcutVersion: 2, shortcuts: { playPause: 'KeyS' } }).shortcuts
   ).toMatchObject({ playPause: 'KeyS', favorite: 'None' })
 })
+it('keeps panel visibility and queue side preferences off/right by default and accepts stored values', () => {
+  expect(playbackPreferencesSchema.parse({})).toMatchObject({
+    keepCommentsPanel: false,
+    keepFavoritePanel: false,
+    queuePanelSide: 'right'
+  })
+  expect(
+    readPlaybackPreferences({
+      keepCommentsPanel: true,
+      keepFavoritePanel: true,
+      queuePanelSide: 'left'
+    })
+  ).toMatchObject({ keepCommentsPanel: true, keepFavoritePanel: true, queuePanelSide: 'left' })
+})
 it('persists application and playback preferences across restart without changing account data', () => {
   const { store, file } = setup()
   store.call('createAccount', { id: 'a', name: 'A' })
@@ -115,7 +129,9 @@ it('persists application and playback preferences across restart without changin
       autoplay: false,
       seekStep: 30,
       wheelNavigation: false,
-      pauseOnBlur: true
+      pauseOnBlur: true,
+      keepCommentsPanel: true,
+      keepFavoritePanel: true
     })
   })
   store.call('close', undefined)
@@ -138,7 +154,9 @@ it('persists application and playback preferences across restart without changin
     autoplay: false,
     seekStep: 30,
     wheelNavigation: false,
-    pauseOnBlur: true
+    pauseOnBlur: true,
+    keepCommentsPanel: true,
+    keepFavoritePanel: true
   })
   expect(next.call('accounts', undefined)).toHaveLength(1)
   expect(next.call('checkDatabase', {})).toMatchObject({ ok: true, issues: 0 })

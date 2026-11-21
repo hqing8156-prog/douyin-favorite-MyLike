@@ -63,6 +63,10 @@ function setup(collected = false) {
     badFolderItems: false,
     unavailableWorkIds: [] as string[],
     failure: '' as Operation | '',
+    deleteFailure: '' as '' | 'EMPTY_RESPONSE' | 'API_REJECTED',
+    deleteTakesEffect: false,
+    createFailure: '' as '' | 'API_REJECTED',
+    createTakesEffect: false,
     hold: null as (() => Promise<void>) | null,
     afterWrite: null as (() => void) | null,
     confirmedDespiteFailure: false
@@ -117,7 +121,16 @@ function setup(collected = false) {
           if (workId && !platform.folderWorkIds.includes(workId)) platform.folderWorkIds.push(workId)
         }
         platform.afterWrite?.()
+        if (operation === 'favoriteFolderCreate' && parameters.action === '2') {
+          if (platform.deleteTakesEffect)
+            platform.folders = platform.folders.filter(
+              (folder) => folder.collects_id_str !== parameters.collects_id
+            )
+          if (platform.deleteFailure) throw new AppError(platform.deleteFailure, 'fixture delete failure')
+        }
         if (operation === 'favoriteFolderCreate' && parameters.action === '1') {
+          if (platform.createFailure && !platform.createTakesEffect)
+            throw new AppError(platform.createFailure, 'fixture create failure')
           const folder = {
             collects_id_str: '9',
             collects_name: parameters.collects_name!,
@@ -125,6 +138,7 @@ function setup(collected = false) {
             status: parameters.secret === '1' ? 0 : 1
           }
           platform.folders.push(folder)
+          if (platform.createFailure) throw new AppError(platform.createFailure, 'fixture create failure')
           return { status_code: 0, collects_info: folder }
         }
         return { status_code: 0 }
@@ -743,6 +757,86 @@ it('writes local-only folders and their contents after an explicit writeback cli
     { id: folder.id, remoteId: '9', localOnly: false, localCount: 1 }
   ])
 })
+it('links a folder the platform reports as rejected but did create', async () => {
+  const { service, scope, store, platform } = setup()
+  const folder = localFolder(store, 'local-rejected', '新建收藏夹', true)
+  const editor = await service.open(scope)
+  await service.save('a', editor.token, [folder.id])
+  store.call('appPreferences', { preferences: { syncFavoritesToCloud: true } })
+  platform.createFailure = 'API_REJECTED'
+  platform.createTakesEffect = true
+
+  await expect(service.syncToCloud('a', () => {})).resolves.toMatchObject({
+    synced: 3,
+    remaining: 0
+  })
+
+  expect(store.call('favoriteFolders', { accountId: 'a' })).toMatchObject([
+    { id: folder.id, title: '新建收藏夹', remoteId: '9', localOnly: false }
+  ])
+})
+it('keeps the create queued when a rejected folder did not appear in the cloud', async () => {
+  const { service, scope, store, platform } = setup()
+  const folder = localFolder(store, 'local-rejected', '新建收藏夹', true)
+  const editor = await service.open(scope)
+  await service.save('a', editor.token, [folder.id])
+  store.call('appPreferences', { preferences: { syncFavoritesToCloud: true } })
+  platform.createFailure = 'API_REJECTED'
+  platform.createTakesEffect = false
+
+  await expect(service.syncToCloud('a', () => {})).rejects.toMatchObject({
+    code: 'API_REJECTED'
+  })
+  expect(store.call('favoriteFolders', { accountId: 'a' })).toMatchObject([
+    { id: folder.id, title: '新建收藏夹', remoteId: null, localOnly: true }
+  ])
+  expect(store.call('favoriteWriteOps', { accountId: 'a' }).map((op) => op.kind)).toEqual([
+    'folder-create',
+    'folder-add',
+    'favorite-add'
+  ])
+})
+it('retries an unconfirmed folder add once, then skips it so the queue continues', async () => {
+  const { service, scope, store, platform, writes } = setup()
+  const folder = localFolder(store, 'local-retry', '重试', true)
+  const editor = await service.open(scope)
+  await service.save('a', editor.token, [folder.id])
+  store.call('appPreferences', { preferences: { syncFavoritesToCloud: true } })
+  platform.folderWorkIds = ['2']
+  platform.folderAddVisible = false
+
+  await expect(service.syncToCloud('a', () => {})).resolves.toMatchObject({
+    synced: 2,
+    skipped: 1,
+    remaining: 0
+  })
+
+  const adds = writes().filter((call) => call.operation === 'favoriteFolderAdd')
+  expect(adds.map((call) => call.parameters.item_type)).toEqual(['2', '68'])
+  expect(store.call('favoriteWriteOps', { accountId: 'a' })).toHaveLength(0)
+  expect(
+    store.call('favoriteFolders', { accountId: 'a' }).find((entry) => entry.id === folder.id)
+  ).toMatchObject({ localCount: 1, localOnly: false })
+})
+it('skips an unconfirmed folder add when the platform reports the work unavailable', async () => {
+  const { service, scope, store, platform, writes } = setup()
+  const folder = localFolder(store, 'local-unavailable', '不可用', true)
+  const editor = await service.open(scope)
+  await service.save('a', editor.token, [folder.id])
+  store.call('appPreferences', { preferences: { syncFavoritesToCloud: true } })
+  platform.folderWorkIds = ['2']
+  platform.folderAddVisible = false
+  platform.unavailableWorkIds = [work.id]
+
+  await expect(service.syncToCloud('a', () => {})).resolves.toMatchObject({
+    synced: 1,
+    skipped: 2,
+    remaining: 0
+  })
+
+  expect(writes().filter((call) => call.operation === 'favoriteFolderAdd')).toHaveLength(1)
+  expect(store.call('favoriteWriteOps', { accountId: 'a' })).toHaveLength(0)
+})
 it('renames a cloud-linked folder on both the cloud and locally', async () => {
   const { service, store, writes } = setup()
   const folder = localFolder(store, 'local-rename', '旧名称', true)
@@ -821,6 +915,104 @@ it('keeps the local folder visible when cloud deletion is not confirmed', async 
   expect(store.call('favoriteFolders', { accountId: 'a' })).toEqual(
     expect.arrayContaining([expect.objectContaining({ id: '8', title: '音乐' })])
   )
+})
+it('finishes a cloud deletion when an empty reply hides a deletion that did take effect', async () => {
+  const { service, store, platform } = setup()
+  const folders = await service.refreshFolders('a')
+  for (const folder of folders)
+    store.call('favoriteRememberFolder', { accountId: 'a', remoteId: 'remote-a', folder })
+  platform.deleteFailure = 'EMPTY_RESPONSE'
+  platform.deleteTakesEffect = true
+
+  const result = await service.deleteCloudFolder('a', '8')
+
+  expect(result).toMatchObject({ folderId: '8', title: '音乐' })
+  expect(store.call('favoriteFolders', { accountId: 'a' })).not.toEqual(
+    expect.arrayContaining([expect.objectContaining({ id: '8' })])
+  )
+  expect(store.call('favoriteHiddenFolderIds', { accountId: 'a' })).toContain('8')
+})
+it('keeps a cloud folder when an empty reply leaves it in place', async () => {
+  const { service, store, platform } = setup()
+  const folders = await service.refreshFolders('a')
+  for (const folder of folders)
+    store.call('favoriteRememberFolder', { accountId: 'a', remoteId: 'remote-a', folder })
+  platform.deleteFailure = 'EMPTY_RESPONSE'
+
+  await expect(service.deleteCloudFolder('a', '8')).rejects.toMatchObject({ code: 'EMPTY_RESPONSE' })
+  expect(store.call('favoriteFolders', { accountId: 'a' })).toEqual(
+    expect.arrayContaining([expect.objectContaining({ id: '8', title: '音乐' })])
+  )
+})
+it('finishes a cloud deletion the platform reports as already gone', async () => {
+  const { service, store, platform } = setup()
+  const folders = await service.refreshFolders('a')
+  for (const folder of folders)
+    store.call('favoriteRememberFolder', { accountId: 'a', remoteId: 'remote-a', folder })
+  platform.deleteFailure = 'API_REJECTED'
+  platform.deleteTakesEffect = true
+
+  await expect(service.deleteCloudFolder('a', '8')).resolves.toMatchObject({ folderId: '8' })
+  expect(store.call('favoriteFolders', { accountId: 'a' })).not.toEqual(
+    expect.arrayContaining([expect.objectContaining({ id: '8' })])
+  )
+})
+it('removes an empty cloud folder the platform no longer has', async () => {
+  const { service, store, platform, writes } = setup()
+  const folders = await service.refreshFolders('a')
+  for (const folder of folders)
+    store.call('favoriteRememberFolder', { accountId: 'a', remoteId: 'remote-a', folder })
+  platform.folders = platform.folders.filter((folder) => folder.collects_id_str !== '8')
+
+  const result = await service.reconcileFolders('a')
+
+  expect(result).toMatchObject({ removed: 1, unlinked: 0 })
+  expect(result.folders).not.toEqual(expect.arrayContaining([expect.objectContaining({ id: '8' })]))
+  expect(writes()).toHaveLength(0)
+})
+it('turns a missing cloud folder into a local-only folder when it still has works', async () => {
+  const { service, store, platform } = setup()
+  const folders = await service.refreshFolders('a')
+  for (const folder of folders)
+    store.call('favoriteRememberFolder', { accountId: 'a', remoteId: 'remote-a', folder })
+  store.call('favoriteConfirm', {
+    accountId: 'a',
+    remoteId: 'remote-a',
+    work,
+    folder: { id: '8', title: '音乐', remoteId: '8', remoteCount: 1, localCount: 0 },
+    synced: true
+  })
+  platform.folders = platform.folders.filter((folder) => folder.collects_id_str !== '8')
+  store.call('favoriteQueueWrite', {
+    accountId: 'a',
+    remoteId: 'remote-a',
+    kind: 'folder-add',
+    folderId: '8',
+    workId: work.id
+  })
+
+  const result = await service.reconcileFolders('a')
+
+  expect(result).toMatchObject({ removed: 0, unlinked: 1 })
+  expect(result.folders).toEqual(
+    expect.arrayContaining([
+      expect.objectContaining({ id: '8', title: '音乐', localOnly: true, remoteId: null, localCount: 1 })
+    ])
+  )
+  expect(store.call('favoriteWriteOps', { accountId: 'a' })).not.toEqual(
+    expect.arrayContaining([expect.objectContaining({ folderId: '8' })])
+  )
+})
+it('keeps folders that are still in the cloud untouched', async () => {
+  const { service, store } = setup()
+  const folders = await service.refreshFolders('a')
+  for (const folder of folders)
+    store.call('favoriteRememberFolder', { accountId: 'a', remoteId: 'remote-a', folder })
+
+  const result = await service.reconcileFolders('a')
+
+  expect(result).toMatchObject({ removed: 0, unlinked: 0 })
+  expect(result.folders.filter((folder) => !folder.localOnly)).toHaveLength(2)
 })
 it('renames a local-only folder without touching the cloud', async () => {
   const { service, store, writes } = setup()
@@ -1260,8 +1452,8 @@ it('writes listed local differences when the cloud count includes an unreadable 
     store.call('favoriteFolders', { accountId: 'a' }).find((entry) => entry.id === '8')?.remoteCount
   ).toBe(2)
 })
-it('retains a folder write when the platform accepts it but the refreshed list does not show it', async () => {
-  const { service, store, platform } = setup()
+it('retries once and skips a folder write the refreshed list still does not show', async () => {
+  const { service, store, platform, writes } = setup()
   store.call('favoriteConfirm', {
     accountId: 'a',
     remoteId: 'remote-a',
@@ -1276,15 +1468,13 @@ it('retains a folder write when the platform accepts it but the refreshed list d
 
   await expect(
     service.syncToCloud('a', () => {}, { folderIds: ['8'], includeDefault: false })
-  ).rejects.toMatchObject({
-    code: 'WRITE_UNCONFIRMED',
-    message: expect.stringContaining(`workId=${work.id}`)
-  })
+  ).resolves.toMatchObject({ synced: 1, remaining: 0, skipped: 1 })
+  expect(writes().filter((call) => call.operation === 'favoriteFolderAdd')).toHaveLength(2)
   expect(
     store
       .call('favoriteWriteOps', { accountId: 'a' })
       .some((operation) => operation.kind === 'folder-add' && operation.workId === work.id)
-  ).toBe(true)
+  ).toBe(false)
 })
 it('preserves confirmed folder membership if a paused older synchronization later finishes', async () => {
   const { service, scope, store } = setup()

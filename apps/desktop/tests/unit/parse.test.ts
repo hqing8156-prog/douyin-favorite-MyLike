@@ -8,6 +8,7 @@ import {
   parseMedia,
   parseFavoriteState,
   parseCommentPage,
+  parseDanmaku,
   parseWork,
   parseResponse,
   safeMediaUrl
@@ -316,6 +317,81 @@ describe('platform responses', () => {
       'https://a.douyinpic.com/origin.jpg'
     ])
   })
+  it('reports danmaku availability and the per-work token from work details', () => {
+    const detail = {
+      aweme_detail: {
+        aweme_id: '123',
+        authentication_token: 'token-1',
+        danmaku_control: { enable_danmaku: true, danmaku_cnt: 8855 },
+        video: { duration: 91_818_000, play_addr: { url_list: ['https://a.douyinvod.com/v'] } }
+      }
+    }
+    expect(parseMedia(detail).danmaku).toEqual({
+      count: 8855,
+      enabled: true,
+      token: 'token-1',
+      durationMs: 91_818_000
+    })
+    const withoutToken = { aweme_detail: { aweme_id: '123', danmaku_control: { danmaku_cnt: 1 } } }
+    expect(parseMedia(withoutToken).danmaku).toBeNull()
+    expect(
+      parseMedia({
+        aweme_detail: {
+          aweme_id: '124',
+          authentication_token: 'token-2',
+          danmaku_control: { enable_danmaku: false, danmaku_cnt: 0 },
+          video: { duration: 60_000 }
+        }
+      }).danmaku
+    ).toMatchObject({ enabled: false, count: 0 })
+  })
+  it('parses one danmaku window, sorts it and keeps an empty window valid', () => {
+    expect(
+      parseDanmaku(
+        {
+          danmaku_list: [
+            {
+              danmaku_id: '9001',
+              item_id: '123',
+              offset_time: 5000,
+              text: '  第二 条  ',
+              extra: { style_list: [{ color: '#FF0000' }] }
+            },
+            { danmaku_id: '9002', item_id: '123', offset_time: 1000, text: '第一条' },
+            { danmaku_id: '9003', item_id: '123', offset_time: 'bad', text: '跳过' },
+            { danmaku_id: '9004', item_id: '123', offset_time: 3000, text: '   ' }
+          ],
+          total: 4
+        },
+        '123',
+        0,
+        32_000
+      )
+    ).toEqual({
+      items: [
+        { id: '9002', timeMs: 1000, text: '第一条', color: null },
+        { id: '9001', timeMs: 5000, text: '第二 条', color: '#ff0000' }
+      ],
+      start: 0,
+      end: 32_000,
+      total: 4
+    })
+    expect(parseDanmaku({ danmaku_list: null, total: 0 }, '123', 0, 32_000)).toEqual({
+      items: [],
+      start: 0,
+      end: 32_000,
+      total: 0
+    })
+    expect(() => parseDanmaku({ danmaku_list: {} }, '123', 0, 32_000)).toThrow()
+    expect(() =>
+      parseDanmaku(
+        { danmaku_list: [{ danmaku_id: '1', item_id: '999', offset_time: 0, text: 'x' }] },
+        '123',
+        0,
+        32_000
+      )
+    ).toThrow()
+  })
 })
 
 describe('main-world page request', () => {
@@ -378,6 +454,54 @@ describe('main-world page request', () => {
     expect(new URL(requested[0]!).searchParams.get('msToken')).toBe('detail-session')
     expect(new URL(requested[0]!).searchParams.get('from_tab_name')).toBe('main')
     expect(new URL(requested[0]!).searchParams.get('showTab')).toBe('like')
+  })
+  it('requests one danmaku window with the work credential and a video referer', async () => {
+    let requested = ''
+    let options: Record<string, unknown> = {}
+    const context = {
+      URLSearchParams,
+      AbortController,
+      Map,
+      setTimeout,
+      clearTimeout,
+      document: { cookie: 'msToken=dm-session' },
+      fetch: async (url: string, init: Record<string, unknown>) => {
+        requested = url
+        options = init
+        return { status: 200, headers: new Headers(), text: async () => '{}' }
+      }
+    }
+    await runInNewContext(
+      buildPageScript({
+        id: 'danmaku',
+        operation: 'danmaku',
+        parameters: {
+          group_id: '123',
+          item_id: '123',
+          start_time: '32000',
+          end_time: '64000',
+          duration: '91818000',
+          authentication_token: 'token-1'
+        },
+        timeout: 1000
+      }),
+      context
+    )
+    const url = new URL(requested)
+    expect(url.pathname).toBe('/aweme/v1/web/danmaku/get_v2/')
+    for (const [key, value] of Object.entries({
+      group_id: '123',
+      item_id: '123',
+      start_time: '32000',
+      end_time: '64000',
+      duration: '91818000',
+      authentication_token: 'token-1',
+      app_name: 'aweme',
+      format: 'json',
+      msToken: 'dm-session'
+    }))
+      expect(url.searchParams.get(key)).toBe(value)
+    expect(options.referrer).toBe('https://www.douyin.com/video/123')
   })
   it('falls back to structured data from the work page when detail API is empty', async () => {
     const requested: string[] = []

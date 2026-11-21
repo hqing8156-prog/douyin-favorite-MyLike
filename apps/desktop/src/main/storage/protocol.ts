@@ -68,6 +68,7 @@ export interface Inputs {
   }
   favoriteLocalFolderEdit: { accountId: string; folderId: string; title: string }
   favoriteLocalFolderDelete: { accountId: string; folderId: string }
+  favoriteFoldersReconcile: { accountId: string; liveRemoteIds: string[] }
   favoriteCloudFolderEdit: { accountId: string; folderId: string; title: string }
   favoriteCloudFolderDelete: { accountId: string; folderId: string }
   favoriteQueueWrite: {
@@ -257,6 +258,7 @@ export interface Replies {
   favoriteLocalFolderCreate: FavoriteFolder
   favoriteLocalFolderEdit: FavoriteFolder
   favoriteLocalFolderDelete: { folderId: string; title: string; localCount: number }
+  favoriteFoldersReconcile: { removed: number; unlinked: number }
   favoriteCloudFolderEdit: FavoriteFolder
   favoriteCloudFolderDelete: { folderId: string; title: string; localCount: number }
   favoriteQueueWrite: null

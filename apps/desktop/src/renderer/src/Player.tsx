@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState, type RefObject } from 'react'
+import { useEffect, useLayoutEffect, useRef, useState, type RefObject } from 'react'
 import {
   ArrowLeft,
   ChevronLeft,
@@ -23,12 +23,13 @@ import {
 } from 'lucide-react'
 import type { PlaybackPosition, PlaybackPreferences, UnlikeTask } from '../../shared/contracts'
 import type { Playback } from './usePlayback'
-import { QueuePanel } from './QueuePanel'
 import { CommentsPanel } from './CommentsPanel'
+import { DanmakuLayer } from './DanmakuLayer'
 import { GalleryProgress, MediaCaption, SeekBar, SpeedMenu } from './PlayerControls'
 import { PreparedVideo } from './PreparedVideo'
 import './player.css'
 import { usePlayerShortcuts } from './usePlayerShortcuts'
+import { useDanmaku } from './useDanmaku'
 import { keyLabel, type ShortcutAction } from '../../shared/preferences'
 import { FavoriteDialog } from './FavoriteDialog'
 import { call } from './api'
@@ -56,6 +57,11 @@ type Props = {
   cloudSyncEnabled: boolean
   queueOpen: boolean
   setQueueOpen: (open: boolean) => void
+  queueJump: { current: (index: number) => void }
+  commentsOpen: boolean
+  setCommentsOpen: (open: boolean) => void
+  favoriteOpen: boolean
+  setFavoriteOpen: (open: boolean) => void
   fullscreenRoot: RefObject<HTMLDivElement | null>
   fullscreenActive: boolean
   clean: boolean
@@ -65,6 +71,16 @@ type Props = {
 const seconds = (value: number) => (Number.isFinite(value) ? Math.max(0, Math.min(86400, value)) : 0)
 const clock = (value: number) =>
   `${Math.floor(seconds(value) / 60)}:${String(Math.floor(seconds(value) % 60)).padStart(2, '0')}`
+const danmakuSizes = [
+  { value: 'small', label: '小' },
+  { value: 'medium', label: '中' },
+  { value: 'large', label: '大' }
+] as const
+const danmakuRegions = [
+  { value: 'quarter', label: '1/4' },
+  { value: 'half', label: '1/2' },
+  { value: 'full', label: '全屏' }
+] as const
 export function Player({
   playback,
   preferences,
@@ -82,6 +98,11 @@ export function Player({
   cloudSyncEnabled,
   queueOpen,
   setQueueOpen,
+  queueJump,
+  commentsOpen,
+  setCommentsOpen,
+  favoriteOpen,
+  setFavoriteOpen,
   fullscreenRoot,
   fullscreenActive,
   clean,
@@ -95,7 +116,8 @@ export function Player({
     video = useRef<HTMLVideoElement>(null),
     poster = useRef<HTMLImageElement>(null),
     preloadedImage = useRef<HTMLImageElement | null>(null),
-    music = useRef<HTMLAudioElement>(null)
+    music = useRef<HTMLAudioElement>(null),
+    footer = useRef<HTMLElement>(null)
   const [image, setImage] = useState(queue.position.slide),
     [candidate, setCandidate] = useState(0),
     [mediaError, setMediaError] = useState('')
@@ -111,12 +133,41 @@ export function Player({
     [musicWarning, setMusicWarning] = useState('')
   const [captionExpanded, setCaptionExpanded] = useState(false)
   const [rotation, setRotation] = useState(0)
-  const [commentsOpen, setCommentsOpen] = useState(false)
+  const [danmakuMenu, setDanmakuMenu] = useState(false)
   const commentsButton = useRef<HTMLButtonElement>(null)
-  const [favoriteOpen, setFavoriteOpen] = useState(false),
-    [collected, setCollected] = useState(false),
+  const danmakuControl = useRef<HTMLDivElement>(null)
+  const [collected, setCollected] = useState(false),
     [liked, setLiked] = useState(true)
   useEffect(() => setRotation(0), [work.id])
+  useEffect(() => setDanmakuMenu(false), [work.id])
+  useEffect(() => {
+    if (!danmakuMenu) return
+    const outside = (event: PointerEvent) => {
+      if (event.target instanceof Node && !danmakuControl.current?.contains(event.target))
+        setDanmakuMenu(false)
+    }
+    const escape = (event: KeyboardEvent) => {
+      if (event.key === 'Escape') setDanmakuMenu(false)
+    }
+    document.addEventListener('pointerdown', outside)
+    document.addEventListener('keydown', escape)
+    return () => {
+      document.removeEventListener('pointerdown', outside)
+      document.removeEventListener('keydown', escape)
+    }
+  }, [danmakuMenu])
+  // The queue panel is rendered outside the keyed Player, so it needs the footer height
+  // published on the shell to stay clear of the controls.
+  useLayoutEffect(() => {
+    const element = footer.current,
+      shell = fullscreenRoot.current
+    if (!element || !shell) return
+    const apply = () => shell.style.setProperty('--player-footer-height', `${element.offsetHeight}px`)
+    apply()
+    const observer = new ResizeObserver(apply)
+    observer.observe(element)
+    return () => observer.disconnect()
+  }, [fullscreenRoot])
   useEffect(() => {
     let current = true
     setLiked(true)
@@ -186,6 +237,10 @@ export function Player({
     captionAuthorUrl = media?.work.authorUrl ?? work.authorUrl ?? null,
     captionTitle = media?.caption || media?.work.title || work.title,
     captionPublishedAt = media?.work.publishedAt || work.publishedAt
+  const danmakuInfo = !gallery && media?.work.mediaType === 'video' ? (media.danmaku ?? null) : null,
+    danmakuAvailable = !!danmakuInfo && danmakuInfo.enabled && danmakuInfo.count > 0,
+    danmakuEnabled = preferences.danmaku && danmakuAvailable && !gallery,
+    danmakuItems = useDanmaku(media, queue.accountId, video, danmakuEnabled)
   const position = (): PlaybackPosition => {
     if (!media) return queue.position
     return {
@@ -390,6 +445,7 @@ export function Player({
     pause()
     void playback.move(target)
   }
+  queueJump.current = move
   const closeComments = () => {
     setCommentsOpen(false)
     commentsButton.current?.focus()
@@ -400,13 +456,9 @@ export function Player({
       closeComments()
       return
     }
-    setQueueOpen(false)
     setCommentsOpen(true)
   }
-  const toggleQueue = () => {
-    setCommentsOpen(false)
-    setQueueOpen(!queueOpen)
-  }
+  const toggleQueue = () => setQueueOpen(!queueOpen)
   const changeClean = (value: boolean) => {
     if (value) setCommentsOpen(false)
     setClean(value)
@@ -498,10 +550,9 @@ export function Player({
       return false
     }
   )
-  const wheelAction = useRef<(delta: number) => void>(() => {})
-  wheelAction.current = (delta) => {
-    if (!preferences.wheelNavigation || document.querySelector('dialog[open]') || !playback.isCurrent(scope))
-      return
+  /** Shared by the stage and the favorite dialog's backdrop (see below). */
+  const navigateWheel = (delta: number) => {
+    if (!preferences.wheelNavigation || !playback.isCurrent(scope)) return
     const direction = delta > 0 ? 'next' : 'previous'
     if (
       (direction === 'next' && queue.index + 1 >= queue.total) ||
@@ -509,6 +560,13 @@ export function Player({
     )
       return
     if (playback.acceptWheel()) move(direction)
+  }
+  const wheelAction = useRef<(delta: number) => void>(() => {})
+  wheelAction.current = (delta) => {
+    // Modal dialogs block the stage; the persistent (non-modal) bar leaves the
+    // video interactive, so its presence does not stop wheel navigation.
+    if (document.querySelector('dialog[open]:modal')) return
+    navigateWheel(delta)
   }
   useEffect(() => {
     let delta = 0,
@@ -738,6 +796,17 @@ export function Player({
               }}
             />
           )}
+          {danmakuEnabled && (
+            <DanmakuLayer
+              video={video}
+              items={danmakuItems}
+              opacity={preferences.danmakuOpacity}
+              size={preferences.danmakuSize}
+              speed={preferences.danmakuSpeed}
+              region={preferences.danmakuRegion}
+              rotation={rotation}
+            />
+          )}
           {!playing && hasContent && !queue.completed && !mediaError && (
             <button className="stage-play" aria-label="继续播放媒体" onClick={() => play()}>
               <Play size={52} fill="currentColor" />
@@ -804,7 +873,6 @@ export function Player({
             </div>
           )}
         </div>
-        {queueOpen && <QueuePanel queue={queue} jump={move} close={() => setQueueOpen(false)} />}
         {commentsOpen && !clean && (
           <CommentsPanel
             scope={{
@@ -819,7 +887,7 @@ export function Player({
           />
         )}
       </div>
-      <footer className="player-footer">
+      <footer ref={footer} className="player-footer">
         {gallery && media && media.images.length > 0 && (
           <GalleryProgress
             count={media.images.length}
@@ -834,6 +902,7 @@ export function Player({
             duration={videoDuration}
             value={Math.min(videoTime, videoDuration || 1)}
             disabled={!ready || !videoDuration}
+            step={preferences.seekStep}
             change={(value) => {
               if (video.current) {
                 video.current.currentTime = value
@@ -847,6 +916,7 @@ export function Player({
             label="音乐进度"
             duration={musicDuration}
             value={Math.min(musicTime, musicDuration || 1)}
+            step={preferences.seekStep}
             change={(value) => {
               if (music.current) music.current.currentTime = value
             }}
@@ -962,6 +1032,73 @@ export function Player({
                 <Star size={19} fill="currentColor" />
               </button>
             )}
+            <div className="danmaku-control-wrap" ref={danmakuControl}>
+              <button
+                className="danmaku-control"
+                aria-label={preferences.danmaku ? '关闭弹幕' : '开启弹幕'}
+                aria-pressed={danmakuEnabled}
+                disabled={!danmakuAvailable}
+                title={
+                  danmakuAvailable
+                    ? `${preferences.danmaku ? '关闭' : '开启'}弹幕（${danmakuInfo!.count.toLocaleString('zh-CN')} 条）；右键调整字号、区域和速度`
+                    : '当前作品暂无弹幕'
+                }
+                onClick={() => updatePreferences({ danmaku: !preferences.danmaku })}
+                onContextMenu={(event) => {
+                  event.preventDefault()
+                  event.stopPropagation()
+                  if (danmakuAvailable) setDanmakuMenu((open) => !open)
+                }}
+              >
+                弹
+              </button>
+              {danmakuMenu && danmakuAvailable && (
+                <div className="danmaku-menu" role="dialog" aria-label="弹幕设置">
+                  <div className="danmaku-menu-row">
+                    <span>字号</span>
+                    <div className="danmaku-menu-options">
+                      {danmakuSizes.map((option) => (
+                        <button
+                          key={option.value}
+                          aria-pressed={preferences.danmakuSize === option.value}
+                          onClick={() => updatePreferences({ danmakuSize: option.value })}
+                        >
+                          {option.label}
+                        </button>
+                      ))}
+                    </div>
+                  </div>
+                  <div className="danmaku-menu-row">
+                    <span>显示区域</span>
+                    <div className="danmaku-menu-options">
+                      {danmakuRegions.map((option) => (
+                        <button
+                          key={option.value}
+                          aria-pressed={preferences.danmakuRegion === option.value}
+                          onClick={() => updatePreferences({ danmakuRegion: option.value })}
+                        >
+                          {option.label}
+                        </button>
+                      ))}
+                    </div>
+                  </div>
+                  <div className="danmaku-menu-row">
+                    <span>速度</span>
+                    <input
+                      aria-label="弹幕速度"
+                      type="range"
+                      min="0.5"
+                      max="2"
+                      step="0.25"
+                      value={preferences.danmakuSpeed}
+                      onChange={(event) => updatePreferences({ danmakuSpeed: Number(event.target.value) })}
+                    />
+                    <span className="danmaku-menu-value">{preferences.danmakuSpeed}x</span>
+                  </div>
+                  <p className="danmaku-menu-hint">左键「弹」快速开关</p>
+                </div>
+              )}
+            </div>
             <button
               ref={commentsButton}
               aria-label="查看评论"
@@ -1024,6 +1161,8 @@ export function Player({
           login={login}
           cloudSync={cloudSyncEnabled}
           saved={() => setCollected(true)}
+          keepOpen={preferences.keepFavoritePanel}
+          uncollect={() => unlike('favorites')}
         />
       )}
     </section>

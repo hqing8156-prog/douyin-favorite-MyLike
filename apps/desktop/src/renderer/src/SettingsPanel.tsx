@@ -64,7 +64,7 @@ const groups = [
     id: 'playback',
     title: '播放',
     icon: Play,
-    keywords: '播放 自动 连播 音量 倍速 失焦 暂停 滚轮 快进 后退 图集 实况'
+    keywords: '播放 自动 连播 音量 倍速 失焦 暂停 滚轮 快进 后退 图集 实况 评论 收藏夹 面板 保持 切换 作品'
   },
   {
     id: 'shortcuts',
@@ -420,12 +420,48 @@ export function SettingsPanel({
                 change={(pauseOnBlur) => updatePreferences({ pauseOnBlur })}
               />
             </Row>
+            <Row
+              label="刷视频时保持评论区"
+              description="手动打开或关闭评论区后，切换作品沿用上次状态；关闭此项时，每次切换作品都会收起评论区"
+            >
+              <Toggle
+                label="刷视频时保持评论区"
+                value={preferences.keepCommentsPanel}
+                change={(keepCommentsPanel) => updatePreferences({ keepCommentsPanel })}
+              />
+            </Row>
+            <Row
+              label="刷视频时保持收藏夹栏"
+              description="进入播放器时自动展开，切换作品时保持并跟随新作品，保存后也不关闭；栏打开时仍可正常操作播放器。点 × 或按 Esc 关闭后，下一条作品也保持收起。关闭此项时恢复默认：手动打开，切换作品或保存后自动关闭"
+            >
+              <Toggle
+                label="刷视频时保持收藏夹栏"
+                value={preferences.keepFavoritePanel}
+                change={(keepFavoritePanel) => updatePreferences({ keepFavoritePanel })}
+              />
+            </Row>
+            <Row
+              label="播放列表展开方向"
+              description="播放队列贴在播放器左侧还是右侧；右侧可能与收藏夹栏重叠"
+            >
+              <Select
+                label="播放列表展开方向"
+                value={preferences.queuePanelSide}
+                onChange={(value) =>
+                  updatePreferences({ queuePanelSide: value === 'left' ? 'left' : 'right' })
+                }
+                options={[
+                  { value: 'right', label: '右侧' },
+                  { value: 'left', label: '左侧' }
+                ]}
+              />
+            </Row>
             <Row label="快进 / 后退步长">
               <Select
                 label="快进后退步长"
                 value={String(preferences.seekStep)}
                 onChange={(value) => updatePreferences({ seekStep: Number(value) })}
-                options={[5, 10, 15, 30, 60].map((v) => ({ value: String(v), label: `${v} 秒` }))}
+                options={[1, 2, 3, 5, 10, 15, 30, 60].map((v) => ({ value: String(v), label: `${v} 秒` }))}
               />
             </Row>
             <Row label="播放倍速">
@@ -449,6 +485,68 @@ export function SettingsPanel({
                 onChange={(e) => updatePreferences({ volume: Number(e.target.value) })}
               />
               <span className="setting-number">{Math.round(preferences.volume * 100)}%</span>
+            </Row>
+            <Row label="弹幕" description="播放器底部栏的「弹」也可以随时开关">
+              <Toggle
+                label="显示弹幕"
+                value={preferences.danmaku}
+                change={(danmaku) => updatePreferences({ danmaku })}
+              />
+            </Row>
+            <Row label="弹幕不透明度">
+              <input
+                aria-label="弹幕不透明度"
+                type="range"
+                min="0.2"
+                max="1"
+                step=".05"
+                value={preferences.danmakuOpacity}
+                onChange={(e) => updatePreferences({ danmakuOpacity: Number(e.target.value) })}
+              />
+              <span className="setting-number">{Math.round(preferences.danmakuOpacity * 100)}%</span>
+            </Row>
+            <Row label="弹幕字号">
+              <Select
+                label="弹幕字号"
+                value={preferences.danmakuSize}
+                onChange={(value) =>
+                  updatePreferences({
+                    danmakuSize: value === 'small' ? 'small' : value === 'large' ? 'large' : 'medium'
+                  })
+                }
+                options={[
+                  { value: 'small', label: '小' },
+                  { value: 'medium', label: '中' },
+                  { value: 'large', label: '大' }
+                ]}
+              />
+            </Row>
+            <Row label="弹幕速度">
+              <Select
+                label="弹幕速度"
+                value={String(preferences.danmakuSpeed)}
+                onChange={(value) => updatePreferences({ danmakuSpeed: Number(value) })}
+                options={[0.75, 1, 1.25, 1.5, 2].map((value) => ({
+                  value: String(value),
+                  label: `${value}x`
+                }))}
+              />
+            </Row>
+            <Row label="弹幕显示区域">
+              <Select
+                label="弹幕显示区域"
+                value={preferences.danmakuRegion}
+                onChange={(value) =>
+                  updatePreferences({
+                    danmakuRegion: value === 'quarter' ? 'quarter' : value === 'full' ? 'full' : 'half'
+                  })
+                }
+                options={[
+                  { value: 'quarter', label: '顶部 1/4' },
+                  { value: 'half', label: '顶部 1/2' },
+                  { value: 'full', label: '全屏' }
+                ]}
+              />
             </Row>
             <Row
               label="图集轮播"

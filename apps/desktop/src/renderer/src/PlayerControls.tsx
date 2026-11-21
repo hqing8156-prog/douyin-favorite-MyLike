@@ -107,13 +107,16 @@ export function SeekBar({
   value,
   duration,
   disabled,
-  change
+  change,
+  step
 }: {
   label: string
   value: number
   duration: number
   disabled?: boolean
   change: (value: number) => void
+  /** Seconds moved by the arrow keys while the slider has focus. */
+  step?: number
 }) {
   const progress = duration ? Math.max(0, Math.min(100, (value / duration) * 100)) : 0
   return (
@@ -128,6 +131,13 @@ export function SeekBar({
         value={Math.min(value, duration || 1)}
         disabled={disabled || !duration}
         onChange={(event) => change(Number(event.target.value))}
+        onKeyDown={(event) => {
+          // Clicking the track leaves focus here, where the browser would step by the
+          // input's 0.1 s granularity instead of the configured seek step.
+          if (!step || (event.key !== 'ArrowLeft' && event.key !== 'ArrowRight')) return
+          event.preventDefault()
+          change(Math.max(0, Math.min(duration, value + (event.key === 'ArrowRight' ? step : -step))))
+        }}
       />
     </div>
   )
@@ -146,8 +156,14 @@ export function GalleryProgress({
 }) {
   const root = useRef<HTMLDivElement>(null),
     pointer = useRef<number | null>(null),
-    lastSelected = useRef(active),
-    dragged = useRef(false)
+    lastSelected = useRef(active)
+  // The bar is deliberately taller than the 2px line it paints: every pixel of the
+  // band, including the gaps between segments, maps to a slide.
+  const indexAt = (clientX: number) => {
+    const bounds = root.current?.getBoundingClientRect()
+    if (!bounds?.width) return null
+    return Math.min(count - 1, Math.max(0, Math.floor(((clientX - bounds.left) / bounds.width) * count)))
+  }
   return (
     <div
       ref={root}
@@ -155,43 +171,26 @@ export function GalleryProgress({
       role="tablist"
       aria-label="图集进度"
       onPointerDown={(event) => {
-        if (event.button !== 0 || !(event.target instanceof HTMLButtonElement)) return
+        if (event.button !== 0) return
+        const index = indexAt(event.clientX)
+        if (index === null) return
         pointer.current = event.pointerId
-        lastSelected.current = active
-        dragged.current = false
-        event.target.setPointerCapture(event.pointerId)
+        lastSelected.current = index
+        event.currentTarget.setPointerCapture(event.pointerId)
+        if (index !== active) select(index)
       }}
       onPointerMove={(event) => {
         if (pointer.current !== event.pointerId) return
-        const bounds = root.current?.getBoundingClientRect()
-        if (!bounds || !bounds.width) return
-        const index = Math.min(
-          count - 1,
-          Math.max(0, Math.floor(((event.clientX - bounds.left) / bounds.width) * count))
-        )
-        if (index !== lastSelected.current) {
-          dragged.current = true
-          lastSelected.current = index
-          select(index)
-        }
+        const index = indexAt(event.clientX)
+        if (index === null || index === lastSelected.current) return
+        lastSelected.current = index
+        select(index)
       }}
       onPointerUp={(event) => {
-        if (pointer.current === event.pointerId) {
-          pointer.current = null
-          if (dragged.current) window.setTimeout(() => (dragged.current = false), 0)
-        }
+        if (pointer.current === event.pointerId) pointer.current = null
       }}
       onPointerCancel={(event) => {
-        if (pointer.current === event.pointerId) {
-          pointer.current = null
-          dragged.current = false
-        }
-      }}
-      onClickCapture={(event) => {
-        if (!dragged.current) return
-        event.preventDefault()
-        event.stopPropagation()
-        dragged.current = false
+        if (pointer.current === event.pointerId) pointer.current = null
       }}
     >
       {Array.from({ length: count }, (_, index) => {

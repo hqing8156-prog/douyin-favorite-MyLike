@@ -28,7 +28,8 @@ import {
   parseMedia,
   parseFavoriteFolders,
   parseFavoritesPage,
-  parseCommentPage
+  parseCommentPage,
+  parseDanmaku
 } from './douyin/parse'
 import { Authentication } from './authentication'
 import type { AccessTarget } from './douyin/page-state'
@@ -464,7 +465,7 @@ export class Application {
       this.favoriteSyncLast = {
         accountId,
         status: stopped ? 'stopped' : 'completed',
-        message: skipped ? `跳过 ${skipped} 个不可用作品，详情见本地写回日志` : null,
+        message: skipped ? `跳过 ${skipped} 个不可见或未确认作品，详情见本地写回日志` : null,
         at: Date.now()
       }
     } catch (error) {
@@ -1724,6 +1725,7 @@ export class Application {
         'favoriteFolderEditLocal',
         'favoriteFolderRenameCloud',
         'favoriteFolderDeleteCloud',
+        'favoriteFoldersReconcile',
         'favoriteFolderRemoveWorks',
         'favoriteFolderMoveWorks',
         'favoriteFolderUpdateWorks',
@@ -1776,6 +1778,7 @@ export class Application {
         'favoriteFolderRenameCloud',
         'favoriteFolderDeleteCloud',
         'favoriteFolderDeleteLocal',
+        'favoriteFoldersReconcile',
         'favoriteFolderMoveWorks',
         'favoriteFolderUpdateWorks',
         'favoriteFolderAddWorks',
@@ -2113,6 +2116,16 @@ export class Application {
           this.changed()
           return result
         }
+      case 'favoriteFoldersReconcile':
+        await this.active(input.accountId)
+        this.assertAvailable(input.accountId, ['folders'])
+        if (this.collection.running || this.favorites.running || this.unlike.running)
+          throw new AppError('BUSY', '请先停止其他采集或取消点赞 / 收藏任务，再核对收藏夹。')
+        {
+          const result = await this.favoriteActions.reconcileFolders(input.accountId)
+          if (result.removed || result.unlinked) this.libraryRevision++
+          return result
+        }
       case 'favoriteFoldersRefresh':
         await this.active(input.accountId)
         this.assertAvailable(input.accountId, ['folders'])
@@ -2153,7 +2166,9 @@ export class Application {
           this.favoriteSyncLast = {
             accountId: input.accountId,
             status: this.favoriteSyncStopRequested ? 'stopped' : 'completed',
-            message: result.skipped ? `跳过 ${result.skipped} 个不可用作品，详情见本地写回日志` : null,
+            message: result.skipped
+              ? `跳过 ${result.skipped} 个不可见或未确认作品，详情见本地写回日志`
+              : null,
             at: Date.now()
           }
           return result
@@ -2613,6 +2628,28 @@ export class Application {
           } finally {
             this.activeMedia = null
           }
+        })
+      }
+      case 'danmaku': {
+        const { accountId, workId, token, durationMs, start, end } = input
+        // Danmaku windows are fetched while playback continues, so they skip the
+        // global busy flag and only take a turn in the shared request lane.
+        return this.lane.run(true, async () => {
+          if (this.closing) throw new AppError('CLOSING', '应用正在退出，未发送新的请求。')
+          await this.active(accountId)
+          return parseDanmaku(
+            await this.engine.request(accountId, 'danmaku', {
+              group_id: workId,
+              item_id: workId,
+              start_time: String(start),
+              end_time: String(end),
+              duration: String(durationMs),
+              authentication_token: token
+            }),
+            workId,
+            start,
+            end
+          )
         })
       }
       case 'comments': {

@@ -3,7 +3,8 @@ import {
   readFavoriteFolderCovers,
   recordFavoriteFolderVisit,
   recordFavoriteFolderVisits,
-  sortFavoriteFoldersByVisit
+  sortFavoriteFoldersByVisit,
+  sortFavoriteFoldersForSelection
 } from '../../src/renderer/src/favorite-folder-recency'
 
 afterEach(() => vi.unstubAllGlobals())
@@ -33,6 +34,27 @@ it('ranks local and cloud folders together by most recent visit', () => {
   expect(sortFavoriteFoldersByVisit(folders, { cloud: 10, local: 20 }).map(({ id }) => id)).toEqual([
     'local',
     'cloud'
+  ])
+})
+
+it('puts folders already containing the selection first, keeping visit order inside each group', () => {
+  const folders = [
+    { id: 'hot', title: '常访问', localCount: 0, remoteCount: 0 },
+    { id: 'has', title: '已含所选', localCount: 0, remoteCount: 0 },
+    { id: 'cold', title: '陌生', localCount: 0, remoteCount: 0 },
+    { id: 'has-cold', title: '已含所选但很少访问', localCount: 0, remoteCount: 0 }
+  ]
+
+  expect(
+    sortFavoriteFoldersForSelection(folders, { hot: 50, has: 20 }, { has: 2, 'has-cold': 1 }).map(
+      ({ id }) => id
+    )
+  ).toEqual(['has', 'has-cold', 'hot', 'cold'])
+  expect(sortFavoriteFoldersForSelection(folders, { hot: 50, has: 20 }, null).map(({ id }) => id)).toEqual([
+    'hot',
+    'has',
+    'cold',
+    'has-cold'
   ])
 })
 

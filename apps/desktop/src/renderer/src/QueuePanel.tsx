@@ -7,11 +7,13 @@ import { Film, FileText, ImageIcon, ListVideo, Play, X } from 'lucide-react'
 export function QueuePanel({
   queue,
   jump,
-  close
+  close,
+  side
 }: {
   queue: QueueState
   jump: (index: number) => void
   close: () => void
+  side: 'left' | 'right'
 }) {
   const scroll = useRef<HTMLDivElement>(null),
     scope = useRef(queue.queueId),
@@ -31,12 +33,21 @@ export function QueuePanel({
     last = rows.at(-1)?.index ?? queue.index
   const center = useRef(Math.floor(first / 50))
   center.current = Math.floor(first / 50)
+  const anchored = useRef<{ queueId: string; index: number } | null>(null)
   useEffect(() => {
     setCache(new Map())
     setError('')
   }, [queue.queueId])
   useEffect(() => {
-    virtual.scrollToIndex(queue.index, { align: 'auto' })
+    const previous = anchored.current
+    anchored.current = { queueId: queue.queueId, index: queue.index }
+    // StrictMode re-runs effects with the same queue and row; keep the first
+    // alignment instead of re-anchoring the row to the bottom of the viewport.
+    if (previous?.queueId === queue.queueId && previous.index === queue.index) return
+    // Opening the panel puts the current row at the top; later track changes only
+    // nudge it back into view so the list keeps the user's scroll position.
+    const fresh = !previous || previous.queueId !== queue.queueId
+    virtual.scrollToIndex(queue.index, { align: fresh ? 'start' : 'auto' })
   }, [queue.queueId, queue.index])
   useEffect(() => {
     const queueId = queue.queueId
@@ -69,7 +80,7 @@ export function QueuePanel({
     }
   }, [queue.queueId, first, last, retry, cache])
   return (
-    <aside className="queue-panel" aria-label="播放队列">
+    <aside className="queue-panel" data-side={side} aria-label="播放队列">
       <div className="queue-heading">
         <ListVideo size={17} />
         <h2>

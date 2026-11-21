@@ -107,7 +107,10 @@
   container-type: size;
   background: radial-gradient(ellipse at center, #26262b 0%, #17171a 50%, #111113 85%);
 }
+/* The 20px band is the hit area; only the 2px line inside it is painted. Hovering
+   anywhere on the band thickens every segment, matching the video seek bar. */
 .gallery-progress {
+  --gallery-bar-height: 2px;
   position: absolute;
   z-index: 4;
   top: -10px;
@@ -121,6 +124,10 @@
   touch-action: pan-y;
   user-select: none;
 }
+.gallery-progress:hover,
+.gallery-progress:has(.gallery-progress-segment:focus-visible) {
+  --gallery-bar-height: 6px;
+}
 .gallery-progress:active {
   cursor: grabbing;
 }
@@ -128,30 +135,37 @@
   position: relative;
   flex: 1 1 0;
   min-width: 0;
-  height: 2px;
-  margin-top: 9px;
+  height: 100%;
   padding: 0;
   border: 0;
   border-radius: 2px;
-  overflow: hidden;
-  background: #ffffff55;
+  background: transparent;
   cursor: inherit;
 }
+.gallery-progress-segment::before,
 .gallery-progress-segment::after {
   content: '';
   position: absolute;
-  inset: 0 auto 0 0;
+  top: 50%;
+  height: var(--gallery-bar-height);
+  border-radius: 2px;
+  transform: translateY(-50%);
+  transition: height 0.12s;
+}
+.gallery-progress-segment::before {
+  right: 0;
+  left: 0;
+  background: #ffffff55;
+}
+.gallery-progress-segment::after {
+  left: 0;
   width: var(--segment-progress);
   background: #fff;
-  border-radius: inherit;
 }
-.gallery-progress-segment:hover,
 .gallery-progress-segment:focus-visible {
-  height: 6px;
-  margin-top: 7px;
   outline: 0;
 }
-.gallery-progress-segment:focus-visible {
+.gallery-progress-segment:focus-visible::before {
   box-shadow: 0 0 0 2px #ffffff90;
 }
 .player-backdrop {
@@ -187,6 +201,12 @@
 }
 .stage > audio {
   display: none;
+}
+/* Danmaku sits above the video but below captions, controls and dialogs. */
+.danmaku-layer {
+  position: absolute;
+  z-index: 2;
+  pointer-events: none;
 }
 .video-surface {
   z-index: 1;
@@ -398,6 +418,12 @@
   background: transparent;
   cursor: pointer;
 }
+/* Sliders already show focus by thickening the track and revealing the thumb;
+   the global accent outline would otherwise wrap the whole bar in a red frame. */
+.player-footer .seek-bar input:focus-visible,
+.player-tools input[type='range']:focus-visible {
+  outline: none;
+}
 .seek-bar input::-webkit-slider-runnable-track {
   height: 2px;
   background: transparent;
@@ -553,6 +579,77 @@
 .playback-controls .unlike-control.is-liked {
   color: #ff6683;
 }
+.playback-controls .danmaku-control {
+  font-size: 13px;
+  font-weight: 700;
+  line-height: 1;
+}
+.playback-controls .danmaku-control:disabled {
+  opacity: 0.35;
+}
+.danmaku-control-wrap {
+  position: relative;
+  display: inline-flex;
+}
+.danmaku-menu {
+  position: absolute;
+  z-index: 6;
+  right: -6px;
+  bottom: calc(100% + 10px);
+  width: 216px;
+  padding: 10px 12px;
+  border: 1px solid #ffffff16;
+  border-radius: 10px;
+  background: #1c1c22f8;
+  box-shadow: 0 14px 34px #0009;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+.danmaku-menu-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  font-size: 12px;
+  color: #c7c7d0;
+}
+.danmaku-menu-options {
+  display: flex;
+  gap: 4px;
+}
+.danmaku-menu-row input[type='range'] {
+  width: 96px;
+  margin: 0;
+}
+.danmaku-menu-value {
+  min-width: 30px;
+  text-align: right;
+  font-size: 11px;
+  color: #a4a4b0;
+}
+.playback-controls .danmaku-menu-options button {
+  width: auto;
+  min-width: 34px;
+  height: 24px;
+  padding: 0 8px;
+  font-size: 12px;
+  color: #c7c7d0;
+  background: #ffffff0d;
+}
+.playback-controls .danmaku-menu-options button:hover:not(:disabled) {
+  background: #ffffff18;
+  color: #fff;
+}
+.playback-controls .danmaku-menu-options button[aria-pressed='true'] {
+  color: #fff;
+  background: #ffffff26;
+}
+.danmaku-menu-hint {
+  margin: 0;
+  font-size: 11px;
+  color: #7f7f8b;
+}
 .playback-controls .favorite-control.is-collected {
   color: #ffcd58;
   background: transparent;
@@ -622,7 +719,6 @@
 .player-view.is-clean .player-heading,
 .player-view.is-clean .player-notice,
 .player-view.is-clean .player-footer,
-.player-view.is-clean .queue-panel,
 .player-view.is-clean .stage > :not(video, audio, img, .video-surface) {
   display: none;
 }
@@ -660,12 +756,18 @@
   align-items: center;
   gap: 8px;
 }
+/* Rendered beside the keyed Player so the list survives work switches; the footer
+   height is published on the shell by Player. */
+.player-shell.is-clean .queue-panel {
+  display: none;
+}
 .queue-panel {
   position: absolute;
   z-index: 5;
   right: 12px;
+  left: auto;
   top: calc(max(30px, env(titlebar-area-height, 30px)) + 10px);
-  bottom: 12px;
+  bottom: calc(var(--player-footer-height, 0px) + 12px);
   width: 320px;
   max-width: calc(100% - 24px);
   display: flex;
@@ -677,6 +779,18 @@
   box-shadow: 0 8px 40px #0008;
   overflow: hidden;
   color: #eeeef5;
+}
+.queue-panel[data-side='left'] {
+  left: 12px;
+  right: auto;
+}
+/* The left queue panel floats over the stage, so keep the caption text clear of it. */
+.player-shell:has(.queue-panel[data-side='left']) .media-caption {
+  padding-left: min(356px, 58%);
+}
+/* Comments and the queue can stay open together; keep a right-side queue clear. */
+.player-shell:has(.comments-panel) .queue-panel[data-side='right'] {
+  right: calc(clamp(240px, 36%, 380px) + 24px);
 }
 .queue-heading {
   display: flex;

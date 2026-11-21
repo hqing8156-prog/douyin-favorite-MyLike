@@ -47,7 +47,23 @@ export const playbackPreferencesSchema = z
     autoplay: z.boolean().default(true),
     wheelNavigation: z.boolean().default(true),
     pauseOnBlur: z.boolean().default(false),
-    seekStep: z.number().int().min(1).max(60).default(10),
+    /**
+     * Keep the comments panel open (or closed) across works. Off restores the default
+     * where every work switch closes it.
+     */
+    keepCommentsPanel: z.boolean().default(false),
+    /** Keep the favorite folder bar open (or closed) across works. */
+    keepFavoritePanel: z.boolean().default(false),
+    /** Show the danmaku layer over videos. */
+    danmaku: z.boolean().default(true),
+    danmakuOpacity: z.number().min(0.2).max(1).default(0.8),
+    danmakuSize: z.enum(['small', 'medium', 'large']).default('medium'),
+    danmakuSpeed: z.number().min(0.5).max(2).default(1),
+    /** Vertical portion of the video the danmaku occupies. */
+    danmakuRegion: z.enum(['quarter', 'half', 'full']).default('half'),
+    /** Side of the player where the queue list expands. */
+    queuePanelSide: z.enum(['left', 'right']).default('right'),
+    seekStep: z.number().int().min(1).max(60).default(1),
     shortcuts: z.object(shortcutShape).prefault({})
   })
   .refine((value) => {

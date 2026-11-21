@@ -1,6 +1,6 @@
 import { CollectionActions } from './CollectionActions'
-import { useEffect, useMemo, useState } from 'react'
-import { Cloud, CloudOff, Pencil, Sparkles, Trash2 } from 'lucide-react'
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
+import { Cloud, Pencil, Sparkles, Trash2 } from 'lucide-react'
 import type { FavoriteFolder, FavoritesTask, Snapshot } from '../../shared/contracts'
 import type { RecoveryState } from '../../shared/recovery-state'
 import { taskRecovery } from '../../shared/task-recovery'
@@ -13,6 +13,9 @@ import {
   recordFavoriteFolderVisit,
   sortFavoriteFoldersByVisit
 } from './favorite-folder-recency'
+
+/** A live folder listing costs one platform request per page and may rewrite the cache. */
+const LIVE_FOLDER_CHECK_INTERVAL_MS = 120_000
 
 export function FavoriteIssues({ task }: { task: FavoritesTask | null }) {
   return task?.issues?.length ? (
@@ -44,6 +47,8 @@ export function useFavoriteFolders(
     accountId: string
     folders: FavoriteFolder[]
   } | null>(null)
+  const checkedAt = useRef(new Map<string, number>())
+  const checking = useRef(new Set<string>())
   useEffect(() => {
     if (!accountId) return
     let current = true
@@ -62,15 +67,37 @@ export function useFavoriteFolders(
       current = false
     }
   }, [accountId, revision, onError])
-  const refresh = async () => {
+  const apply = useCallback((id: string, folders: FavoriteFolder[]) => {
+    setResult({ accountId: id, folders })
+    checkedAt.current.set(id, Date.now())
+  }, [])
+  const refresh = useCallback(async () => {
     if (!accountId) return []
-    const folders = await call(window.mylike.invoke('favoriteFoldersRefresh', { accountId }))
-    setResult({ accountId, folders })
+    const { folders } = await call(window.mylike.invoke('favoriteFoldersReconcile', { accountId }))
+    apply(accountId, folders)
     return folders
-  }
+  }, [accountId, apply])
+  /**
+   * Visiting the favorites page reconciles the local folder cache with the
+   * cloud listing: cloud-deleted folders lose their link (or disappear when
+   * empty). Failures stay silent and keep the cached list.
+   */
+  const reconcile = useCallback(async () => {
+    if (!accountId) return
+    if (checking.current.has(accountId)) return
+    if (Date.now() - (checkedAt.current.get(accountId) ?? 0) < LIVE_FOLDER_CHECK_INTERVAL_MS) return
+    checking.current.add(accountId)
+    try {
+      await refresh()
+    } catch {
+      // Keep the cached list and retry after the throttle window.
+    } finally {
+      checking.current.delete(accountId)
+    }
+  }, [accountId, refresh])
   return result?.accountId === accountId
-    ? { ...result, loaded: true, refresh }
-    : { folders: [], loaded: false, refresh }
+    ? { folders: result.folders, loaded: true, refresh, reconcile }
+    : { folders: [], loaded: false, refresh, reconcile }
 }
 export function FavoritesPanel({
   accountId,
@@ -191,13 +218,16 @@ export function FavoritesPanel({
               displayLabel: (
                 <>
                   <span className="select-option-folder-title">{folder.title}</span>
-                  <span
-                    className="select-option-status"
-                    role="img"
-                    aria-label={folder.remoteId ? '云端有此收藏夹' : '云端没有此收藏夹'}
-                  >
-                    {folder.remoteId ? <Cloud size={14} /> : <CloudOff size={14} />}
-                  </span>
+                  {folder.remoteId && (
+                    <span
+                      className="select-option-status"
+                      role="img"
+                      aria-label="云端有此收藏夹"
+                      title="云端有此收藏夹"
+                    >
+                      <Cloud size={14} />
+                    </span>
+                  )}
                   <span className="select-option-folder-count">· {folder.localCount}</span>
                 </>
               )

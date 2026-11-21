@@ -1,12 +1,18 @@
 import { useEffect, useMemo, useRef, useState, type FormEvent } from 'react'
-import { FolderHeart, LockKeyhole, PlusCircle, Search, X } from 'lucide-react'
+import { PlusCircle, Search, X } from 'lucide-react'
 import type { FavoriteFolder } from '../../shared/contracts'
 import { call } from './api'
 import {
+  readFavoriteFolderCovers,
   readFavoriteFolderVisits,
-  recordFavoriteFolderVisit,
-  sortFavoriteFoldersByVisit
+  recordFavoriteFolderVisits,
+  sortFavoriteFoldersForSelection
 } from './favorite-folder-recency'
+import {
+  FavoriteFolderCreateForm,
+  FavoriteFolderRow,
+  FavoriteFolderSearchField
+} from './FavoriteFolderPicker'
 import './favorite-dialog.css'
 
 export function MoveToFolderDialog({
@@ -41,6 +47,7 @@ export function MoveToFolderDialog({
   const [membershipError, setMembershipError] = useState('')
   const [visitError, setVisitError] = useState('')
   const [folderVisits, setFolderVisits] = useState<Record<string, number>>({})
+  const [folderCovers, setFolderCovers] = useState<Record<string, string>>({})
   const [folderSearch, setFolderSearch] = useState('')
   const [searchOpen, setSearchOpen] = useState(false)
   const [creating, setCreating] = useState(false)
@@ -58,8 +65,8 @@ export function MoveToFolderDialog({
     [folders, currentFolderId, addOnly, createdFolders]
   )
   const sortedTargets = useMemo(
-    () => sortFavoriteFoldersByVisit(targets, folderVisits),
-    [targets, folderVisits]
+    () => sortFavoriteFoldersForSelection(targets, folderVisits, existingCounts),
+    [targets, folderVisits, existingCounts]
   )
   const normalizedSearch = folderSearch.trim().toLocaleLowerCase()
   const filteredTargets = normalizedSearch
@@ -70,6 +77,7 @@ export function MoveToFolderDialog({
   useEffect(() => {
     try {
       setFolderVisits(readFavoriteFolderVisits(accountId))
+      setFolderCovers(readFavoriteFolderCovers(accountId))
     } catch (error) {
       setVisitError(`读取收藏夹访问记录失败：${error instanceof Error ? error.message : '本地存储不可用。'}`)
     }
@@ -113,6 +121,15 @@ export function MoveToFolderDialog({
     setSubmitting(true)
     try {
       await confirm(addFolderIds, removeFolderIds)
+      // Record recency only after the change is submitted, so checking a
+      // folder never re-sorts the list while the user is still choosing.
+      try {
+        recordFavoriteFolderVisits(accountId, addFolderIds)
+      } catch (error) {
+        setVisitError(
+          `保存收藏夹访问记录失败：${error instanceof Error ? error.message : '本地存储不可用。'}`
+        )
+      }
     } finally {
       setSubmitting(false)
     }
@@ -213,61 +230,31 @@ export function MoveToFolderDialog({
           : '云端写回已关闭，本次调整只记录在本机，抖音云端收藏夹不变。'}
       </p>
       {searchOpen && addOnly && (
-        <div className="favorite-search-field">
-          <input
-            type="search"
-            aria-label="搜索收藏夹名称"
-            placeholder="搜索收藏夹"
-            value={folderSearch}
-            autoFocus
-            onChange={(event) => setFolderSearch(event.target.value)}
-            onKeyDown={(event) => {
-              if (event.key === 'Escape') {
-                event.preventDefault()
-                event.stopPropagation()
-                setFolderSearch('')
-                setSearchOpen(false)
-              }
-            }}
-          />
-          {folderSearch && (
-            <button type="button" aria-label="清空收藏夹搜索" onClick={() => setFolderSearch('')}>
-              <X size={14} />
-            </button>
-          )}
-        </div>
+        <FavoriteFolderSearchField
+          value={folderSearch}
+          onChange={setFolderSearch}
+          onClose={() => setSearchOpen(false)}
+          disabled={moving}
+        />
       )}
       {creating && addOnly && (
-        <form
-          className="favorite-create-form favorite-move-create-form"
+        <FavoriteFolderCreateForm
+          name={folderName}
+          onNameChange={setFolderName}
+          secret={privateFolder}
+          onSecretChange={setPrivateFolder}
+          nameLabel="新收藏夹名称"
+          submitLabel="创建并添加"
+          pendingLabel="正在创建…"
+          pending={creatingFolder}
+          disabled={moving && !creatingFolder}
           onSubmit={(event) => void createFolder(event)}
-        >
-          <label htmlFor="move-folder-name">新收藏夹名称</label>
-          <input
-            id="move-folder-name"
-            aria-label="新收藏夹名称"
-            placeholder="收藏夹名称"
-            maxLength={30}
-            value={folderName}
-            disabled={moving}
-            autoFocus
-            onChange={(event) => setFolderName(event.target.value)}
-          />
-          <div>
-            <label>
-              <input
-                type="checkbox"
-                checked={privateFolder}
-                disabled={moving}
-                onChange={(event) => setPrivateFolder(event.target.checked)}
-              />
-              设为私密
-            </label>
-            <button type="submit" disabled={moving || !folderName.trim()}>
-              {creatingFolder ? '正在创建…' : '创建并添加'}
-            </button>
-          </div>
-        </form>
+          onCancel={() => {
+            setCreating(false)
+            setFolderName('')
+            setCreateError('')
+          }}
+        />
       )}
       <div
         className="favorite-folder-list"
@@ -284,61 +271,41 @@ export function MoveToFolderDialog({
                   ? `已含全部 ${existing} 条`
                   : `已含 ${existing}/${workCount} 条`
             return (
-              <label
-                className="favorite-folder-row favorite-writeback-row"
+              <FavoriteFolderRow
                 key={folder.id}
-                title={existing ? '所选作品已在该收藏夹中的数量；取消勾选可移除' : undefined}
-              >
-                <span className="favorite-folder-cover">
-                  {folder.coverUrl ? (
-                    <img src={folder.coverUrl} alt="" referrerPolicy="no-referrer" />
-                  ) : (
-                    <FolderHeart size={20} />
-                  )}
-                </span>
-                <span className="favorite-folder-name">
-                  <span>{folder.title}</span>
-                  {folder.private && <LockKeyhole size={12} aria-label="私密收藏夹" />}
-                  {existing > 0 && workCount > 1 && (
-                    <span className="favorite-folder-badge">{existingLabel}</span>
-                  )}
-                  <small>
-                    {folder.localOnly ? `仅本机 · ${folder.localCount} 条` : `${folder.localCount} 条`}
-                  </small>
-                </span>
-                <input
-                  type="checkbox"
-                  aria-label={
-                    addOnly
-                      ? existing >= workCount
-                        ? `已含全部 ${folder.title}`
-                        : `加入 ${folder.title}`
-                      : `${existing > 0 ? '从' : '加入'} ${folder.title}`
-                  }
-                  checked={selectedIds.includes(folder.id)}
-                  disabled={
-                    moving ||
-                    existingCounts === null ||
-                    !!membershipError ||
-                    (addOnly && (existingCounts[folder.id] ?? 0) >= workCount)
-                  }
-                  onChange={(event) => {
-                    try {
-                      setFolderVisits(recordFavoriteFolderVisit(accountId, folder.id))
-                      setVisitError('')
-                    } catch (error) {
-                      setVisitError(
-                        `保存收藏夹访问记录失败：${error instanceof Error ? error.message : '本地存储不可用。'}`
-                      )
-                    }
-                    setSelectedIds((ids) =>
-                      event.target.checked
-                        ? [...new Set([...ids, folder.id])]
-                        : ids.filter((id) => id !== folder.id)
-                    )
-                  }}
-                />
-              </label>
+                folder={folder}
+                coverUrl={folderCovers[folder.id]}
+                badge={existing > 0 ? existingLabel : undefined}
+                hint={
+                  existing
+                    ? addOnly
+                      ? '所选作品已在该收藏夹中，不会重复添加'
+                      : '所选作品已在该收藏夹中的数量；取消勾选可移除'
+                    : undefined
+                }
+                checkboxLabel={
+                  addOnly
+                    ? existing >= workCount
+                      ? workCount === 1
+                        ? `已存在 ${folder.title}`
+                        : `已含全部 ${folder.title}`
+                      : `加入 ${folder.title}`
+                    : `${existing > 0 ? '从' : '加入'} ${folder.title}`
+                }
+                className="favorite-writeback-row"
+                checked={selectedIds.includes(folder.id)}
+                disabled={
+                  moving ||
+                  existingCounts === null ||
+                  !!membershipError ||
+                  (addOnly && (existingCounts[folder.id] ?? 0) >= workCount)
+                }
+                onToggle={(checked) =>
+                  setSelectedIds((ids) =>
+                    checked ? [...new Set([...ids, folder.id])] : ids.filter((id) => id !== folder.id)
+                  )
+                }
+              />
             )
           })
         ) : normalizedSearch ? (

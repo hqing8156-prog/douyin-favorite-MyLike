@@ -6,6 +6,8 @@ import { appPreferencesPatchSchema, playbackPreferencesSchema, type AppPreferenc
 export { playbackPreferencesSchema, shortcutKeys } from './preferences'
 
 export const MAX_BATCH_SIZE = 1000
+/** The danmaku endpoint returns at most one 32-second window per request. */
+export const DANMAKU_WINDOW_MS = 32_000
 /** Keeps one writeback run short enough to review and to limit continuous writes. */
 export const WRITEBACK_BATCH_LIMIT = 100
 /** Reuse one cloud reconciliation across consecutive writeback batches. */
@@ -90,6 +92,7 @@ export const commands = {
   }),
   favoriteFolders: z.object({ accountId: idSchema }),
   favoriteFoldersRefresh: z.object({ accountId: idSchema }),
+  favoriteFoldersReconcile: z.object({ accountId: idSchema }),
   favoriteFolderMemberships: z.object({
     accountId: idSchema,
     workIds: z.array(workIdSchema).min(1).max(MAX_BATCH_SIZE)
@@ -313,6 +316,18 @@ export const commands = {
     commentId: workIdSchema.optional(),
     cursor: workIdSchema.default('0')
   }),
+  danmaku: z
+    .object({
+      accountId: idSchema,
+      workId: workIdSchema,
+      token: z.string().min(1).max(4096),
+      durationMs: z.number().int().min(0).max(864_000_000),
+      start: z.number().int().min(0).max(864_000_000),
+      end: z.number().int().min(0).max(864_000_000)
+    })
+    .refine((value) => value.end > value.start && value.end - value.start <= DANMAKU_WINDOW_MS, {
+      message: '弹幕窗口必须不超过 32 秒。'
+    }),
   theme: z.object({ theme: z.enum(['dark', 'light']) }),
   windowPresentation: z.object({ player: z.boolean() }),
   openProject: z.object({}),
@@ -358,12 +373,38 @@ export interface Work {
   /** Douyin work type. 163 is an article/text work; 68 is an image gallery. */
   awemeType?: number | null
 }
+export interface DanmakuInfo {
+  /** Total danmaku the platform reports for this work. */
+  count: number
+  /** Whether the platform allows danmaku on this work. */
+  enabled: boolean
+  /** Per-work credential the danmaku endpoint requires. */
+  token: string
+  /** Work duration in milliseconds, in the unit the danmaku endpoint expects. */
+  durationMs: number
+}
+export interface DanmakuItem {
+  id: string
+  /** Position in the video, milliseconds. */
+  timeMs: number
+  text: string
+  /** CSS hex color when the platform supplied one. */
+  color: string | null
+}
+export interface DanmakuPage {
+  items: DanmakuItem[]
+  start: number
+  end: number
+  total: number
+}
 export interface Media {
   work: Work
   caption?: string
   videos: string[]
   images: { url: string; liveUrl: string | null }[]
   music: string | null
+  /** Present for video works; null when the platform exposes no danmaku data. */
+  danmaku?: DanmakuInfo | null
 }
 export type CommentMediaSource = { url: string; type: 'image' | 'video' }
 export interface WorkComment {
@@ -701,6 +742,7 @@ export interface Outputs {
   favoritesControl: FavoritesTask
   favoriteFolders: FavoriteFolder[]
   favoriteFoldersRefresh: FavoriteFolder[]
+  favoriteFoldersReconcile: { folders: FavoriteFolder[]; removed: number; unlinked: number }
   favoriteFolderMemberships: { folderId: string; count: number }[]
   favoriteSyncToCloud: {
     synced: number
@@ -831,6 +873,7 @@ export interface Outputs {
   clearCache: null
   media: Media
   comments: CommentPage
+  danmaku: DanmakuPage
   theme: null
   windowPresentation: null
   openProject: null

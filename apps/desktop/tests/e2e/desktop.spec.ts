@@ -685,6 +685,10 @@ test('adds selected liked works to a local favorite folder', async () => {
   await expect(folderCheckbox).not.toBeChecked()
   await search.fill('')
   await dialog.getByRole('button', { name: '新建', exact: true }).click()
+  await dialog.getByRole('textbox', { name: '新收藏夹名称', exact: true }).fill('临时收藏夹')
+  await dialog.getByRole('button', { name: '取消新建收藏夹', exact: true }).click()
+  await expect(dialog.getByRole('textbox', { name: '新收藏夹名称', exact: true })).toHaveCount(0)
+  await dialog.getByRole('button', { name: '新建', exact: true }).click()
   await dialog.getByRole('textbox', { name: '新收藏夹名称', exact: true }).fill('从喜欢新建')
   await dialog.getByRole('button', { name: '创建并添加', exact: true }).click()
   const createdCheckbox = dialog.getByRole('checkbox', { name: '加入 从喜欢新建', exact: true })
@@ -705,6 +709,67 @@ test('adds selected liked works to a local favorite folder', async () => {
   expect(memberships).toHaveLength(2)
   expect(memberships).toContainEqual({ folderId: folder.id, count: 1 })
   expect(memberships).toContainEqual({ folderId: createdFolder.id, count: 2 })
+})
+test('marks a single selected work as already in its favorite folder', async () => {
+  const { accountId, ids } = await prepareQueue(3)
+  const folder = (
+    await invoke('favoriteFolderCreateLocal', {
+      accountId,
+      title: '单条已存在',
+      private: false
+    })
+  ).data
+  await invoke('favoriteFolderAddWorks', { accountId, addFolderIds: [folder.id], workIds: ids })
+
+  await page.getByRole('button', { name: '批量选择', exact: true }).click()
+  await page.locator('.work-select').nth(0).check()
+  await page.getByRole('button', { name: '添加到收藏夹', exact: true }).click()
+
+  const dialog = page.getByRole('dialog', { name: '添加到收藏夹', exact: true })
+  await expect(dialog.getByText('已存在', { exact: true })).toBeVisible()
+  await expect(dialog.locator('.favorite-folder-row').first()).toContainText(folder.title)
+  const folderCheckbox = dialog.getByRole('checkbox', { name: `已存在 ${folder.title}`, exact: true })
+  await expect(folderCheckbox).toBeVisible()
+  await expect(folderCheckbox).toBeDisabled()
+  await expect(folderCheckbox).not.toBeChecked()
+  await dialog.getByRole('button', { name: '关闭添加到收藏夹', exact: true }).click()
+})
+test('keeps the batch folder order stable while checking and records recency only after submit', async () => {
+  const { accountId, ids } = await prepareQueue(1)
+  const travel = (await invoke('favoriteFolderCreateLocal', { accountId, title: '旅行', private: false }))
+    .data
+  const music = (await invoke('favoriteFolderCreateLocal', { accountId, title: '音乐', private: false })).data
+  await page.evaluate(
+    ({ accountId, folderId }) =>
+      localStorage.setItem(
+        `mylike:favoriteFolderVisits:${accountId}`,
+        JSON.stringify({ [folderId]: Date.now() })
+      ),
+    { accountId, folderId: music.id }
+  )
+
+  await page.getByRole('button', { name: '批量选择', exact: true }).click()
+  await page.locator('.work-select').nth(0).check()
+  await page.getByRole('button', { name: '添加到收藏夹', exact: true }).click()
+
+  const dialog = page.getByRole('dialog', { name: '添加到收藏夹', exact: true })
+  const rows = dialog.locator('.favorite-folder-row')
+  await expect(rows.first()).toContainText('音乐')
+  await dialog.getByRole('checkbox', { name: '加入 旅行', exact: true }).check()
+  // Checking a folder must not record a visit or re-sort the list mid-dialog.
+  await expect(rows.first()).toContainText('音乐')
+  await dialog.getByRole('button', { name: '添加 1 条作品', exact: true }).click()
+  await expect(page.locator('.notice.success')).toContainText('新增 1 项收藏夹关联')
+
+  const visits = await page.evaluate(
+    (id) => JSON.parse(localStorage.getItem(`mylike:favoriteFolderVisits:${id}`) ?? '{}'),
+    accountId
+  )
+  expect(visits[travel.id]).toBeGreaterThan(visits[music.id])
+  expect((await invoke('favoriteFolderMemberships', { accountId, workIds: ids })).data).toContainEqual({
+    folderId: travel.id,
+    count: 1
+  })
 })
 async function readyVideo(expectedIndex?: number) {
   // A click can finish before queue IPC does. Match the intended track, rendered
@@ -734,6 +799,14 @@ async function readyVideo(expectedIndex?: number) {
       { message: `Expected decoded video for queue index ${expectedIndex ?? 'current'}` }
     )
     .toBe(true)
+}
+/** Freeze the current work at its start so playback cannot advance mid-test. */
+async function pauseAtStart() {
+  await page.locator('video').evaluate((node) => {
+    const video = node as HTMLVideoElement
+    video.pause()
+    video.currentTime = 0
+  })
 }
 async function seekVideo(position: number | { fromEnd: number }, play = false) {
   // Recheck metadata and seek in one renderer operation, avoiding a remount
@@ -1336,7 +1409,9 @@ test('keeps a 50k library virtualized and deletes exactly the selected snapshot 
       const db = new DatabaseSync(join(app.getPath('userData'), 'mylike.sqlite'))
       db.exec('PRAGMA foreign_keys=ON; BEGIN IMMEDIATE;')
       try {
-        const work = db.prepare('INSERT INTO works VALUES(?,?,?,?,?,?,?,?)'),
+        const work = db.prepare(
+            'INSERT INTO works(id,title,author,publishedAt,coverUrl,mediaType,isLive,authorId) VALUES(?,?,?,?,?,?,?,?)'
+          ),
           member = db.prepare('INSERT INTO account_items(accountId,workId,firstSeen) VALUES(?,?,?)')
         for (let i = 0; i < 50000; i++) {
           const id = String(8000000000000000n + BigInt(i))
@@ -1930,6 +2005,159 @@ test('keeps the latest track during rapid moves and shows comments without inter
   }
 })
 
+test('keeps the comments panel and favorite folder bar across works when enabled', async () => {
+  test.setTimeout(testTimeout(90000))
+  const { accountId } = await prepareQueue(5)
+  await invoke('favoriteFolderCreateLocal', { accountId, title: '常驻收藏夹', private: false })
+  const preferences = (await invoke('snapshot')).data.playbackPreferences
+  await invoke('playbackPreferences', {
+    preferences: {
+      ...preferences,
+      keepCommentsPanel: true,
+      keepFavoritePanel: true,
+      queuePanelSide: 'left'
+    }
+  })
+  await page.getByRole('button', { name: '顺序播放', exact: true }).click()
+  await readyVideo(0)
+  await pauseAtStart()
+  const favorite = page.getByRole('dialog', { name: '选择收藏夹', exact: true })
+  // The persisted bar opens with the player.
+  await expect(favorite).toBeVisible()
+  // It is non-modal: the video is not dimmed and the seek bar stays clickable.
+  expect(await favorite.evaluate((node) => node.matches(':modal'))).toBe(false)
+  await page.getByRole('slider', { name: '视频进度', exact: true }).click()
+  await expect(favorite).toBeVisible()
+  // The non-modal bar leaves the player controls usable.
+  await page.getByRole('button', { name: '开始播放', exact: true }).click()
+  await expect(page.getByRole('button', { name: '暂停播放', exact: true })).toBeVisible()
+  await expect(favorite).toBeVisible()
+  await pauseAtStart()
+  // Wheel over the queue list does not switch works.
+  await page.getByRole('button', { name: '显示播放队列', exact: true }).click()
+  const queuePanel = page.getByRole('complementary', { name: '播放队列', exact: true })
+  await expect(queuePanel).toBeVisible()
+  const queueBox = await queuePanel.boundingBox()
+  expect(queueBox).toBeTruthy()
+  const captionBox = await page.locator('.media-caption .caption-author').boundingBox()
+  expect(captionBox).toBeTruthy()
+  expect(captionBox!.x).toBeGreaterThan(queueBox!.x + queueBox!.width)
+  // Comments and the playback list stay open together.
+  const comments = page.getByRole('complementary', { name: '作品评论', exact: true })
+  await page.getByRole('button', { name: '查看评论', exact: true }).click()
+  await expect(comments).toBeVisible()
+  await expect(queuePanel).toBeVisible()
+  await page.getByRole('button', { name: '关闭评论', exact: true }).click()
+  await expect(comments).toBeHidden()
+  await expect(queuePanel).toBeVisible()
+  await page.mouse.move(queueBox!.x + 60, queueBox!.y + 120)
+  await page.mouse.wheel(0, 240)
+  await page.waitForTimeout(800)
+  expect((await invoke('snapshot')).data.playback.index).toBe(0)
+  await page.getByRole('button', { name: '收起播放队列', exact: true }).click()
+  await expect(queuePanel).toBeHidden()
+  // Clicking × closes the bar; the closed state carries over to the next work.
+  await page.getByRole('button', { name: '关闭收藏夹选择', exact: true }).click()
+  await expect(favorite).toHaveCount(0)
+  // Opening the bar again keeps the queue list open.
+  await page.getByRole('button', { name: '显示播放队列', exact: true }).click()
+  await expect(queuePanel).toBeVisible()
+  await page.getByRole('button', { name: '收藏当前作品', exact: true }).click()
+  await expect(favorite).toBeVisible()
+  await expect(queuePanel).toBeVisible()
+  await page.getByRole('button', { name: '关闭收藏夹选择', exact: true }).click()
+  await page.getByRole('button', { name: '收起播放队列', exact: true }).click()
+  await page.getByRole('button', { name: '查看评论', exact: true }).click()
+  await expect(comments).toBeVisible()
+  await seekVideo({ fromEnd: 0.1 }, true)
+  await expect.poll(async () => (await invoke('snapshot')).data.playback.index, { timeout: 20000 }).toBe(1)
+  await readyVideo(1)
+  await pauseAtStart()
+  await expect(comments).toBeVisible()
+  await expect(favorite).toHaveCount(0)
+  // An open bar carries over too, stays open after saving and keeps switching
+  // works on wheel input from the video area.
+  await page.getByRole('button', { name: '收藏当前作品', exact: true }).click()
+  await expect(favorite).toBeVisible()
+  const folderBox = favorite.getByRole('checkbox', { name: '常驻收藏夹', exact: true })
+  await folderBox.check()
+  // Clicking a row focuses its checkbox; playback shortcuts must still reach the
+  // player while the bar is open.
+  await page.keyboard.press('ArrowRight')
+  await expect
+    .poll(() => page.locator('video').evaluate((node) => (node as HTMLVideoElement).currentTime))
+    .toBeGreaterThan(0)
+  await pauseAtStart()
+  await favorite.getByRole('button', { name: '保存', exact: true }).click()
+  await expect(favorite).toBeVisible()
+  await expect(folderBox).toBeChecked()
+  // Unchecking the default list hands off to the uncollect confirm without
+  // closing the persisted bar.
+  const defaultRow = favorite.getByRole('checkbox', { name: '默认收藏列表', exact: true })
+  await expect(defaultRow).toBeChecked()
+  await defaultRow.uncheck()
+  await favorite.getByRole('button', { name: '保存', exact: true }).click()
+  const uncollectConfirm = page.getByRole('dialog', { name: '取消抖音收藏', exact: true })
+  await expect(uncollectConfirm).toContainText('所有收藏夹')
+  await expect(favorite).toBeVisible()
+  await uncollectConfirm.getByRole('button', { name: '取消', exact: true }).click()
+  await expect(uncollectConfirm).toHaveCount(0)
+  await expect(favorite).toBeVisible()
+  await defaultRow.check()
+  // Search and create state must not leak into the next work's bar.
+  await favorite.getByRole('button', { name: '搜索收藏夹', exact: true }).click()
+  await favorite.getByRole('searchbox', { name: '搜索收藏夹名称', exact: true }).fill('常驻')
+  await favorite.getByRole('button', { name: '新建', exact: true }).click()
+  await favorite.getByRole('textbox', { name: '收藏夹名称', exact: true }).fill('临时')
+  await page.mouse.move(200, 300)
+  await page.mouse.wheel(0, 240)
+  await expect.poll(async () => (await invoke('snapshot')).data.playback.index, { timeout: 20000 }).toBe(2)
+  await readyVideo(2)
+  await pauseAtStart()
+  await expect(favorite).toBeVisible()
+  await expect(favorite.getByRole('searchbox', { name: '搜索收藏夹名称', exact: true })).toHaveCount(0)
+  await expect(favorite.getByRole('textbox', { name: '收藏夹名称', exact: true })).toHaveCount(0)
+  await expect(comments).toBeVisible()
+  // With both settings off the reopened bar is modal again: it blocks wheel
+  // switching until it is dismissed, and the next work closes the panels.
+  await invoke('playbackPreferences', {
+    preferences: { ...preferences, keepCommentsPanel: false, keepFavoritePanel: false }
+  })
+  await page.mouse.move(200, 300)
+  await page.mouse.wheel(0, 240)
+  await expect.poll(async () => (await invoke('snapshot')).data.playback.index, { timeout: 20000 }).toBe(3)
+  await readyVideo(3)
+  await pauseAtStart()
+  await expect(favorite).toHaveCount(0)
+  await expect(comments).toBeHidden()
+  await page.getByRole('button', { name: '查看评论', exact: true }).click()
+  await page.getByRole('button', { name: '收藏当前作品', exact: true }).click()
+  await expect(favorite).toBeVisible()
+  await page.mouse.move(200, 300)
+  await page.mouse.wheel(0, 240)
+  await page.waitForTimeout(800)
+  expect((await invoke('snapshot')).data.playback.index).toBe(3)
+  await page.mouse.click(80, 90)
+  await expect(favorite).toHaveCount(0)
+  await page.mouse.move(200, 300)
+  await page.mouse.wheel(0, 240)
+  await expect.poll(async () => (await invoke('snapshot')).data.playback.index, { timeout: 20000 }).toBe(4)
+  await readyVideo(4)
+  await expect(favorite).toHaveCount(0)
+  await expect(comments).toBeHidden()
+  // The two playback settings are the UI entry point for this behavior.
+  await page.getByRole('button', { name: '返回内容库', exact: true }).click()
+  await page.getByRole('button', { name: '设置', exact: true }).click()
+  await page.getByRole('checkbox', { name: '刷视频时保持评论区', exact: true }).check()
+  await page.getByRole('checkbox', { name: '刷视频时保持收藏夹栏', exact: true }).check()
+  await expect
+    .poll(async () => {
+      const stored = (await invoke('snapshot')).data.playbackPreferences
+      return [stored.keepCommentsPanel, stored.keepFavoritePanel]
+    })
+    .toEqual([true, true])
+})
+
 test('resumes a gallery slide and music position, then automatically advances without restarting music between slides', async () => {
   test.setTimeout(testTimeout(60000))
   await prepareQueue(2, true)
@@ -1995,6 +2223,50 @@ test('loops the current video and keeps the queue open across next, jump, wheel 
   await expect(panel).toBeVisible()
   await page.getByRole('button', { name: '收起播放队列', exact: true }).click()
   await expect(panel).toHaveCount(0)
+})
+
+test('expands the playlist on the side selected in settings', async () => {
+  test.setTimeout(testTimeout(45000))
+  await prepareQueue(3)
+  await page.getByRole('button', { name: '设置', exact: true }).click()
+  await chooseOption('播放列表展开方向', '左侧')
+  await expect
+    .poll(async () => (await invoke('snapshot')).data.playbackPreferences.queuePanelSide)
+    .toBe('left')
+  await page.getByRole('button', { name: '喜欢的内容', exact: true }).click()
+  await page.getByRole('button', { name: '顺序播放', exact: true }).click()
+  await readyVideo()
+  await page.getByRole('button', { name: '显示播放队列', exact: true }).click()
+  const panel = page.locator('.queue-panel')
+  await expect(panel).toHaveAttribute('data-side', 'left')
+  await expect.poll(() => panel.evaluate((node) => node.getBoundingClientRect().left)).toBeLessThan(20)
+  await expect
+    .poll(() => panel.evaluate((node) => innerWidth - node.getBoundingClientRect().right))
+    .toBeGreaterThan(200)
+})
+
+test('opens the playlist with the current row at the top', async () => {
+  test.setTimeout(testTimeout(45000))
+  await prepareQueue(20)
+  await page.getByRole('button', { name: '顺序播放', exact: true }).click()
+  await readyVideo()
+  await page.getByRole('button', { name: '显示播放队列', exact: true }).click()
+  const panel = page.getByRole('complementary', { name: '播放队列', exact: true })
+  await changeVideo(() => panel.getByRole('button', { name: '播放队列第 6 条', exact: true }).click(), 5)
+  await page.getByRole('button', { name: '收起播放队列', exact: true }).click()
+  await page.getByRole('button', { name: '显示播放队列', exact: true }).click()
+  await expect
+    .poll(() =>
+      panel.evaluate((node) => {
+        const scroller = node.querySelector('.queue-scroll')!
+        const row = node.querySelector('.queue-row.current')!
+        return {
+          offset: Math.round(row.getBoundingClientRect().top - scroller.getBoundingClientRect().top),
+          scrollTop: Math.round(scroller.scrollTop)
+        }
+      })
+    )
+    .toEqual({ offset: 0, scrollTop: 5 * 72 })
 })
 
 test('keeps the same fullscreen container through buttons, queue jumps, wheel, automatic advance and replay', async () => {
@@ -3880,14 +4152,17 @@ test('selects gallery slides by dragging across the progress bar', async () => {
   const bounds = await page.locator('.gallery-progress').boundingBox()
   expect(bounds).not.toBeNull()
   const y = bounds!.y + bounds!.height / 2
-  await page.mouse.click(bounds!.x + bounds!.width * 0.75, y)
+  // The whole 20px band clicks, not just the 2px line drawn inside it.
+  await page.mouse.click(bounds!.x + bounds!.width * 0.75, bounds!.y + 3)
   await expect(page.locator('.gallery-status')).toContainText('2 / 2')
-  await page.mouse.move(bounds!.x + bounds!.width - 2, y)
+  await page.mouse.click(bounds!.x + bounds!.width * 0.25, bounds!.y + bounds!.height - 3)
+  await expect(page.locator('.gallery-status')).toContainText('1 / 2')
+  await page.mouse.move(bounds!.x + 2, y)
   await page.mouse.down()
-  await page.mouse.move(bounds!.x + 2, y, { steps: 5 })
+  await page.mouse.move(bounds!.x + bounds!.width - 2, y, { steps: 5 })
   await page.mouse.up()
 
-  await expect(page.locator('.gallery-status')).toContainText('1 / 2')
+  await expect(page.locator('.gallery-status')).toContainText('2 / 2')
   await expect(page.getByRole('button', { name: '恢复轮播', exact: true })).toBeVisible()
 })
 
@@ -5662,6 +5937,52 @@ test('searches favorite folders from the playback picker', async () => {
   await dialog.getByRole('button', { name: '关闭收藏夹选择', exact: true }).click()
 })
 
+test('adds an uncollected work to the default favorites list from the picker', async () => {
+  const { accountId } = await prepareQueue(1)
+  await page.getByRole('button', { name: '顺序播放', exact: true }).click()
+  await readyVideo()
+  await pauseAtStart()
+  const work = (await invoke('snapshot')).data.playback.work
+  await page.getByRole('button', { name: '收藏当前作品', exact: true }).click()
+  const dialog = page.getByRole('dialog', { name: '选择收藏夹', exact: true })
+  const defaultRow = dialog.getByRole('checkbox', { name: '默认收藏列表', exact: true })
+  await expect(defaultRow).not.toBeChecked()
+  await expect(defaultRow).toBeEnabled()
+  await defaultRow.check()
+  await dialog.getByRole('button', { name: '保存', exact: true }).click()
+  await expect(dialog).toHaveCount(0)
+  await expect(page.locator('.favorite-control')).toHaveAttribute('aria-pressed', 'true')
+  expect((await invoke('favoriteStatus', { accountId, workId: work.id })).data.collected).toBe(true)
+})
+
+test('keeps the playback folder order stable while checking folders', async () => {
+  const { accountId } = await prepareQueue(1)
+  const travel = (await invoke('favoriteFolderCreateLocal', { accountId, title: '旅行', private: false }))
+    .data
+  const music = (await invoke('favoriteFolderCreateLocal', { accountId, title: '音乐', private: false })).data
+  await page.evaluate(
+    ({ accountId, folderId }) =>
+      localStorage.setItem(
+        `mylike:favoriteFolderVisits:${accountId}`,
+        JSON.stringify({ [folderId]: Date.now() })
+      ),
+    { accountId, folderId: music.id }
+  )
+  await page.getByRole('button', { name: '顺序播放', exact: true }).click()
+  await readyVideo()
+  await page.getByRole('button', { name: '暂停播放', exact: true }).click()
+  await page.getByRole('button', { name: '收藏当前作品', exact: true }).click()
+
+  const dialog = page.getByRole('dialog', { name: '选择收藏夹', exact: true })
+  const rows = dialog.locator('.favorite-folder-row:not(.favorite-default)')
+  await expect(rows.first()).toContainText('音乐')
+  await dialog.getByRole('checkbox', { name: '旅行', exact: true }).check()
+  // Checking a folder must not record a visit or re-sort the list mid-dialog.
+  await expect(rows.first()).toContainText('音乐')
+  await expect(rows.nth(1)).toContainText(travel.title)
+  await dialog.getByRole('button', { name: '关闭收藏夹选择', exact: true }).click()
+})
+
 test('adds liked work to multiple favorite folders through the page SDK and preserves fullscreen', async ({}, info) => {
   const { accountId } = await prepareQueue(3)
   await invoke('appPreferences', { preferences: { syncFavoritesToCloud: true } })
@@ -5685,8 +6006,8 @@ test('adds liked work to multiple favorite folders through the page SDK and pres
   const star = page.getByRole('button', { name: '收藏当前作品', exact: true })
   await star.click()
   const dialog = page.getByRole('dialog', { name: '选择收藏夹', exact: true })
-  await expect(dialog.getByRole('checkbox', { name: '默认收藏列表', exact: true })).toBeChecked()
-  await expect(dialog.getByRole('checkbox', { name: '默认收藏列表', exact: true })).toBeDisabled()
+  await expect(dialog.getByRole('checkbox', { name: '默认收藏列表', exact: true })).not.toBeChecked()
+  await expect(dialog.getByRole('checkbox', { name: '默认收藏列表', exact: true })).toBeEnabled()
   await dialog.getByRole('checkbox', { name: '旅行', exact: true }).check()
   await dialog.getByRole('checkbox', { name: '音乐', exact: true }).check()
   expect(await app.evaluate(() => (globalThis as any).__favoriteWrites ?? [])).toEqual([])
@@ -5709,6 +6030,18 @@ test('adds liked work to multiple favorite folders through the page SDK and pres
   expect(writes[0].body).toMatchObject({ action: '1', aweme_id: current.work.id })
   await page.getByRole('button', { name: '取消当前收藏', exact: true }).click({ button: 'right' })
   const editDialog = page.getByRole('dialog', { name: '选择收藏夹', exact: true })
+  const defaultFolder = editDialog.getByRole('checkbox', { name: '默认收藏列表', exact: true })
+  await expect(defaultFolder).toBeChecked()
+  await expect(defaultFolder).toBeEnabled()
+  // Unchecking the default list and saving hands off to the uncollect confirm.
+  await defaultFolder.uncheck()
+  await editDialog.getByRole('button', { name: '保存', exact: true }).click()
+  await expect(editDialog).toHaveCount(0)
+  const uncollectConfirm = page.getByRole('dialog', { name: '取消抖音收藏', exact: true })
+  await expect(uncollectConfirm).toContainText('所有收藏夹')
+  await uncollectConfirm.getByRole('button', { name: '取消', exact: true }).click()
+  await expect(uncollectConfirm).toHaveCount(0)
+  await page.getByRole('button', { name: '取消当前收藏', exact: true }).click({ button: 'right' })
   const musicFolder = editDialog.getByRole('checkbox', { name: '音乐', exact: true })
   await expect(musicFolder).toBeChecked()
   await expect(musicFolder).toBeEnabled()

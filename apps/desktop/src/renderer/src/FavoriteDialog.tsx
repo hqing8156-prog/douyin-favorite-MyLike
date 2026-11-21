@@ -1,15 +1,19 @@
 import { useEffect, useMemo, useRef, useState } from 'react'
-import { LoaderCircle, LockKeyhole, PlusCircle, Search, Star, X } from 'lucide-react'
+import { LoaderCircle, PlusCircle, Search, Star, X } from 'lucide-react'
 import type { FavoriteEditor, PlaybackScope } from '../../shared/contracts'
 import { call, CommandError } from './api'
 import { favoriteWriteMessage } from './favorite-feedback'
-import { CoverImage } from './CoverImage'
 import {
   readFavoriteFolderCovers,
   readFavoriteFolderVisits,
   recordFavoriteFolderVisits,
-  sortFavoriteFoldersByVisit
+  sortFavoriteFoldersForSelection
 } from './favorite-folder-recency'
+import {
+  FavoriteFolderCreateForm,
+  FavoriteFolderRow,
+  FavoriteFolderSearchField
+} from './FavoriteFolderPicker'
 import './favorite-dialog.css'
 
 export function FavoriteDialog({
@@ -17,13 +21,19 @@ export function FavoriteDialog({
   close,
   login,
   cloudSync,
-  saved
+  saved,
+  keepOpen = false,
+  uncollect
 }: {
   scope: PlaybackScope & { workId: string }
   close: () => void
   login: () => void
   cloudSync: boolean
   saved: () => void
+  /** Persisted mode: non-modal, reloads after saving instead of closing the bar. */
+  keepOpen?: boolean
+  /** Unchecking the default list and saving asks for the normal uncollect flow. */
+  uncollect: () => void
 }) {
   const dialog = useRef<HTMLDialogElement>(null)
   const mounted = useRef(false),
@@ -31,6 +41,9 @@ export function FavoriteDialog({
     sequence = useRef(0)
   const [editor, setEditor] = useState<FavoriteEditor | null>(null)
   const [selected, setSelected] = useState<string[]>([])
+  // The default list mirrors the work's own collected state: it starts
+  // unchecked for works that are not favorited yet.
+  const [defaultSelected, setDefaultSelected] = useState(false)
   const [loading, setLoading] = useState(true),
     [busy, setBusy] = useState(false)
   const [error, setError] = useState(''),
@@ -44,9 +57,15 @@ export function FavoriteDialog({
   const [creating, setCreating] = useState(false),
     [name, setName] = useState(''),
     [secret, setSecret] = useState(true)
+  // Membership and visit recency share one ordering with the batch add dialog:
+  // folders already holding the work come first, then most recently used.
+  const existingCounts = useMemo(
+    () => (editor ? Object.fromEntries(editor.folderIds.map((id) => [id, 1])) : null),
+    [editor]
+  )
   const sortedFolders = useMemo(
-    () => sortFavoriteFoldersByVisit(editor?.folders ?? [], folderVisits),
-    [editor?.folders, folderVisits]
+    () => sortFavoriteFoldersForSelection(editor?.folders ?? [], folderVisits, existingCounts),
+    [editor?.folders, folderVisits, existingCounts]
   )
   const normalizedSearch = folderSearch.trim().toLocaleLowerCase()
   const filteredFolders = normalizedSearch
@@ -66,6 +85,7 @@ export function FavoriteDialog({
       if (!mounted.current || seq !== sequence.current) return
       setEditor(next)
       setSelected(next.folderIds)
+      setDefaultSelected(next.collected)
       setNeedsReload(false)
       setCreating(false)
     } catch (error) {
@@ -79,7 +99,10 @@ export function FavoriteDialog({
   }
   useEffect(() => {
     mounted.current = true
-    dialog.current?.showModal()
+    // The persisted bar is non-modal so the player stays usable underneath:
+    // controls and the queue list keep receiving clicks and wheel input.
+    if (keepOpen) dialog.current?.show()
+    else dialog.current?.showModal()
     try {
       setFolderVisits(readFavoriteFolderVisits(scope.accountId))
       setFolderCovers(readFavoriteFolderCovers(scope.accountId))
@@ -92,11 +115,44 @@ export function FavoriteDialog({
       sequence.current++
     }
   }, [])
+  const closeRef = useRef(close)
+  closeRef.current = close
+  useEffect(() => {
+    if (!keepOpen) return
+    // Non-modal dialogs get no cancel event, so Esc is handled in the capture
+    // phase: it closes the bar before the player's Esc shortcut can exit.
+    const key = (event: KeyboardEvent) => {
+      if (event.key !== 'Escape' || event.defaultPrevented) return
+      // Text entries keep Esc for themselves (clearing search); a checkbox or radio
+      // is not editing text, so Esc closes the bar instead of exiting playback.
+      if (
+        event.target instanceof HTMLElement &&
+        event.target.closest(
+          'textarea, select, [contenteditable], input:not([type=checkbox]):not([type=radio])'
+        )
+      )
+        return
+      event.preventDefault()
+      event.stopImmediatePropagation()
+      if (!pending.current) closeRef.current()
+    }
+    window.addEventListener('keydown', key, true)
+    return () => window.removeEventListener('keydown', key, true)
+  }, [keepOpen])
   const save = async () => {
     if (!editor || loading || needsReload || pending.current || saveComplete) return
+    // Unchecking the default list asks to uncollect the work: hand off to the
+    // regular uncollect confirmation instead of saving folder changes. The
+    // persisted bar stays open so the confirm (and its result) is not lost.
+    if (editor.collected && !defaultSelected) {
+      if (!keepOpen) close()
+      uncollect()
+      return
+    }
     pending.current = true
     setBusy(true)
     setError('')
+    let savedOk = false
     try {
       const existing = new Set(editor.folderIds)
       const addedFolderIds = selected.filter((id) => !existing.has(id))
@@ -122,8 +178,11 @@ export function FavoriteDialog({
           )
         }
         saved()
-        if (visitsSaved) close()
-        else setSaveComplete(true)
+        savedOk = true
+        if (!keepOpen) {
+          if (visitsSaved) close()
+          else setSaveComplete(true)
+        }
       }
     } catch (error) {
       if (mounted.current) {
@@ -132,7 +191,11 @@ export function FavoriteDialog({
       }
     } finally {
       pending.current = false
-      if (mounted.current) setBusy(false)
+      if (mounted.current) {
+        setBusy(false)
+        // The persistent bar stays open and shows the saved memberships.
+        if (keepOpen && savedOk) void reload()
+      }
     }
   }
   const create = async () => {
@@ -173,6 +236,21 @@ export function FavoriteDialog({
         event.preventDefault()
         if (!pending.current) close()
       }}
+      onClick={(event) => {
+        // A native modal dialog reports backdrop clicks with the dialog itself as the
+        // target, so require the pointer to be outside its rendered box. This keeps
+        // clicks in the panel's own padding from closing it.
+        const element = dialog.current
+        if (!element || pending.current || event.target !== event.currentTarget) return
+        const rect = element.getBoundingClientRect()
+        if (
+          event.clientX < rect.left ||
+          event.clientX > rect.right ||
+          event.clientY < rect.top ||
+          event.clientY > rect.bottom
+        )
+          close()
+      }}
     >
       <header className="favorite-dialog-heading">
         <h2 id="favorite-dialog-title">选择收藏夹</h2>
@@ -207,84 +285,39 @@ export function FavoriteDialog({
           aria-label="关闭收藏夹选择"
           disabled={busy}
           onClick={close}
-          autoFocus
+          autoFocus={!keepOpen}
         >
           <X size={18} />
         </button>
       </header>
       {searchOpen && (
-        <div className="favorite-search-field">
-          <input
-            type="search"
-            aria-label="搜索收藏夹名称"
-            placeholder="搜索收藏夹"
-            value={folderSearch}
-            autoFocus
-            onChange={(event) => setFolderSearch(event.target.value)}
-            onKeyDown={(event) => {
-              if (event.key === 'Escape') {
-                event.preventDefault()
-                event.stopPropagation()
-                setFolderSearch('')
-                setSearchOpen(false)
-              }
-            }}
-          />
-          {folderSearch && (
-            <button type="button" aria-label="清空收藏夹搜索" onClick={() => setFolderSearch('')}>
-              <X size={14} />
-            </button>
-          )}
-        </div>
+        <FavoriteFolderSearchField
+          value={folderSearch}
+          onChange={setFolderSearch}
+          onClose={() => setSearchOpen(false)}
+          disabled={loading || busy || needsReload}
+        />
       )}
       {creating && (
-        <form
-          className="favorite-create-form"
+        <FavoriteFolderCreateForm
+          name={name}
+          onNameChange={setName}
+          secret={secret}
+          onSecretChange={setSecret}
+          nameLabel="收藏夹名称"
+          submitLabel="创建"
+          pending={busy}
+          disabled={loading || needsReload}
           onSubmit={(event) => {
             event.preventDefault()
             void create()
           }}
-        >
-          <span className="favorite-create-name">
-            <input
-              aria-label="收藏夹名称"
-              placeholder="收藏夹名称"
-              maxLength={30}
-              value={name}
-              disabled={busy || needsReload}
-              autoFocus
-              onChange={(event) => setName(event.target.value)}
-            />
-            <button
-              type="button"
-              className="favorite-cancel-create"
-              aria-label="取消新建收藏夹"
-              title="取消新建收藏夹"
-              disabled={busy}
-              onClick={() => {
-                setCreating(false)
-                setName('')
-                setError('')
-              }}
-            >
-              <X size={16} />
-            </button>
-          </span>
-          <div>
-            <label>
-              <input
-                type="checkbox"
-                checked={secret}
-                disabled={busy || needsReload}
-                onChange={(event) => setSecret(event.target.checked)}
-              />
-              设为私密
-            </label>
-            <button type="submit" disabled={busy || !name.trim() || needsReload}>
-              创建
-            </button>
-          </div>
-        </form>
+          onCancel={() => {
+            setCreating(false)
+            setName('')
+            setError('')
+          }}
+        />
       )}
       <p className="favorite-local-note" role="note">
         {!cloudSync &&
@@ -302,7 +335,11 @@ export function FavoriteDialog({
             {showDefaultFolder && (
               <label
                 className="favorite-folder-row favorite-default"
-                title="收藏的作品都会保留在默认收藏列表"
+                title={
+                  editor.collected
+                    ? '取消勾选并保存会取消收藏该作品（同时移出所有收藏夹）'
+                    : '勾选后保存会把作品加入默认收藏列表'
+                }
               >
                 <span className="favorite-folder-cover">
                   <Star size={24} fill="currentColor" />
@@ -310,43 +347,33 @@ export function FavoriteDialog({
                 <span className="favorite-folder-name">
                   默认收藏列表 <small>{editor.localCount}</small>
                 </span>
-                <input type="checkbox" aria-label="默认收藏列表" checked disabled />
+                <input
+                  type="checkbox"
+                  aria-label="默认收藏列表"
+                  checked={defaultSelected}
+                  disabled={busy || needsReload}
+                  onChange={(event) => setDefaultSelected(event.target.checked)}
+                />
               </label>
             )}
             {filteredFolders.map((folder) => {
               const alreadyAdded = editor.folderIds.includes(folder.id)
               return (
-                <label
-                  className="favorite-folder-row"
+                <FavoriteFolderRow
                   key={folder.id}
-                  title={alreadyAdded ? '该作品已在此收藏夹中' : undefined}
-                >
-                  <span className="favorite-folder-cover">
-                    <CoverImage url={folderCovers[folder.id] ?? folder.coverUrl} size={24} />
-                  </span>
-                  <span className="favorite-folder-name" title={folder.title}>
-                    <span>{folder.title}</span>
-                    {folder.private && <LockKeyhole size={12} aria-label="私密收藏夹" />}
-                    {alreadyAdded && <span className="favorite-folder-badge">已存在</span>}
-                    <small>
-                      {folder.localCount}
-                      {folder.localOnly ? ' · 本地' : ''}
-                    </small>
-                  </span>
-                  <input
-                    type="checkbox"
-                    aria-label={folder.title}
-                    checked={selected.includes(folder.id)}
-                    disabled={busy || needsReload}
-                    onChange={(event) =>
-                      setSelected((ids) =>
-                        event.target.checked
-                          ? [...new Set([...ids, folder.id])]
-                          : ids.filter((id) => id !== folder.id)
-                      )
-                    }
-                  />
-                </label>
+                  folder={folder}
+                  coverUrl={folderCovers[folder.id]}
+                  badge={alreadyAdded ? '已存在' : undefined}
+                  hint={alreadyAdded ? '该作品已在此收藏夹中' : undefined}
+                  checkboxLabel={folder.title}
+                  checked={selected.includes(folder.id)}
+                  disabled={busy || needsReload}
+                  onToggle={(checked) =>
+                    setSelected((ids) =>
+                      checked ? [...new Set([...ids, folder.id])] : ids.filter((id) => id !== folder.id)
+                    )
+                  }
+                />
               )
             })}
             {normalizedSearch && !showDefaultFolder && filteredFolders.length === 0 && (

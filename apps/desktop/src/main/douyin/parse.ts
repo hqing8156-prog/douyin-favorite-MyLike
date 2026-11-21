@@ -5,7 +5,10 @@ import type {
   FavoriteFolder,
   CommentPage,
   WorkComment,
-  CommentMediaSource
+  CommentMediaSource,
+  DanmakuInfo,
+  DanmakuItem,
+  DanmakuPage
 } from '../../shared/contracts'
 import { AppError } from '../errors'
 import {
@@ -65,6 +68,33 @@ function platformDuration(value: unknown): number {
   const parsed =
     typeof value === 'number' ? value : typeof value === 'string' && /^\d+$/.test(value) ? Number(value) : 0
   return Number.isSafeInteger(parsed) && parsed > 0 ? parsed : 0
+}
+function nonNegativeCount(value: unknown): number {
+  const parsed =
+    typeof value === 'number' ? value : typeof value === 'string' && /^\d+$/.test(value) ? Number(value) : 0
+  return Number.isSafeInteger(parsed) && parsed > 0 ? parsed : 0
+}
+/** Normalizes the platform's optional colour hints without inventing a style. */
+function danmakuColor(value: unknown): string | null {
+  const list = Array.isArray(value) ? value : value ? [value] : []
+  for (const entry of list) {
+    const style = object(entry)
+    for (const candidate of [
+      style.color,
+      style.font_color,
+      style.text_color,
+      style.fontColor,
+      style.textColor
+    ]) {
+      if (typeof candidate === 'string' && /^#?[0-9a-fA-F]{6}$/.test(candidate.trim()))
+        return `#${candidate.trim().replace(/^#/, '').toLowerCase()}`
+      if (typeof candidate === 'number' && Number.isSafeInteger(candidate)) {
+        const hex = candidate.toString(16).padStart(6, '0')
+        if (/^[0-9a-f]{6}$/.test(hex)) return `#${hex}`
+      }
+    }
+  }
+  return null
 }
 const AUTHOR_PROFILE_PREFIX = 'https://www.douyin.com/user/'
 function authorProfileUrl(value: unknown): string | null {
@@ -501,6 +531,52 @@ export function parseFavoriteFolders(
     hasMore
   }
 }
+function danmakuInfo(value: Obj, video: Obj): DanmakuInfo | null {
+  const control = object(value.danmaku_control)
+  const token = typeof value.authentication_token === 'string' ? value.authentication_token.trim() : ''
+  if (!token || token.length > 4096) return null
+  return {
+    count: nonNegativeCount(control.danmaku_cnt),
+    enabled: [true, 1, '1'].includes(control.enable_danmaku as never),
+    token,
+    durationMs: platformDuration(video.duration)
+  }
+}
+/** One 32-second window of danmaku. An empty window is valid, not an error. */
+export function parseDanmaku(data: Obj, workId: string, start: number, end: number): DanmakuPage {
+  const rows = data.danmaku_list
+  if (rows != null && !Array.isArray(rows))
+    throw new AppError('UPSTREAM_CHANGED', '弹幕接口缺少有效的弹幕数组。', 'payload.schema')
+  const items = new Map<string, DanmakuItem>()
+  for (const value of (rows ?? []) as unknown[]) {
+    const row = object(value)
+    if (row.item_id != null && String(row.item_id) !== workId)
+      throw new AppError('INVALID_RESPONSE', '弹幕与当前作品不一致，请重试。', 'payload.target_mismatch')
+    const offset = row.offset_time
+    const timeMs =
+      typeof offset === 'number'
+        ? offset
+        : typeof offset === 'string' && /^\d+$/.test(offset)
+          ? Number(offset)
+          : NaN
+    if (!Number.isSafeInteger(timeMs) || timeMs < 0) continue
+    const label = text(row.text).replace(/\s+/g, ' ').trim().slice(0, 200)
+    if (!label) continue
+    const id = text(row.danmaku_id) || `${timeMs}-${items.size}`
+    items.set(id, {
+      id,
+      timeMs: Math.min(timeMs, end),
+      text: label,
+      color: danmakuColor(object(row.extra).style_list)
+    })
+  }
+  return {
+    items: [...items.values()].sort((a, b) => a.timeMs - b.timeMs),
+    start,
+    end,
+    total: nonNegativeCount(data.total)
+  }
+}
 export function parseMedia(data: Obj): Media {
   if (!data.aweme_detail)
     throw new AppError('WORK_UNAVAILABLE', '暂时无法取得作品详情，可能需要验证或作品已不可访问。')
@@ -536,6 +612,7 @@ export function parseMedia(data: Obj): Media {
     music:
       first(music.play_url?.url_list) ??
       first(music.url_list) ??
-      first(music.matched_pgc_sound?.play_url?.url_list)
+      first(music.matched_pgc_sound?.play_url?.url_list),
+    danmaku: danmakuInfo(value, video)
   }
 }

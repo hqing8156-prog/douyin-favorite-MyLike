@@ -31,9 +31,11 @@ export function responseSummary(
     const items =
       operation === 'comments' || operation === 'commentReplies'
         ? data.comments
-        : operation === 'folders'
-          ? data.collects_list
-          : data.aweme_list
+        : operation === 'danmaku'
+          ? data.danmaku_list
+          : operation === 'folders'
+            ? data.collects_list
+            : data.aweme_list
     const fieldType = (value: unknown) =>
       value === undefined
         ? '缺失'

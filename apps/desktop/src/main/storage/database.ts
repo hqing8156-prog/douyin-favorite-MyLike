@@ -484,6 +484,8 @@ export class Store {
         return this.favorites.localFolderEdit(input)
       case 'favoriteLocalFolderDelete':
         return this.favorites.localFolderDelete(input)
+      case 'favoriteFoldersReconcile':
+        return this.favorites.reconcileFolders(input)
       case 'favoriteCloudFolderEdit':
         return this.favorites.cloudFolderEdit(input)
       case 'favoriteCloudFolderDelete':

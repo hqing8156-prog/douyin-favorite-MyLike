@@ -30,6 +30,22 @@ type WritebackProgress = {
 }
 /** Space between individual platform writes; batch spacing is a separate setting. */
 const WRITEBACK_WRITE_INTERVAL_MS = 1000
+/**
+ * Failures that do not prove a write was ignored. A follow-up cloud listing
+ * decides: for a deletion an absent folder means the write took effect; for a
+ * create a folder with the same title means it exists despite the reply.
+ */
+const UNCONFIRMED_WRITE_CODES = new Set([
+  'EMPTY_RESPONSE',
+  'END_UNCONFIRMED',
+  'TIMEOUT',
+  'NETWORK_ERROR',
+  'API_REJECTED',
+  'WRITE_UNCONFIRMED'
+])
+function unconfirmedWrite(code: string): boolean {
+  return UNCONFIRMED_WRITE_CODES.has(code)
+}
 function folderSecret(folder: FavoriteFolder): string {
   if (folder.private === undefined)
     throw new AppError('FOLDER_CHANGED', '无法确认云端收藏夹的隐私状态，请重新核实收藏夹后重试。')
@@ -719,15 +735,52 @@ export class FavoriteActions {
       )
       if (!folder?.remoteId || folder.localOnly)
         throw new AppError('FOLDER_CHANGED', '云端收藏夹已变化，请重新读取。')
-      parseWriteResult(
-        await this.engine.request(accountId, 'favoriteFolderCreate', {
-          action: '2',
-          collects_id: folder.remoteId
-        })
-      )
+      const remoteId = folder.remoteId
+      try {
+        parseWriteResult(
+          await this.engine.request(accountId, 'favoriteFolderCreate', {
+            action: '2',
+            collects_id: remoteId
+          })
+        )
+      } catch (error) {
+        // The platform sometimes acknowledges a folder deletion with an empty
+        // or unexplained reply (and rejects a folder that is already gone).
+        // Only the cloud listing decides whether the folder still exists; when
+        // it is absent the deletion did take effect, so finish it locally
+        // instead of asking the user to retry a folder that is already gone.
+        if (!(error instanceof AppError) || !unconfirmedWrite(error.code)) throw error
+        const remaining = await this.folders(accountId, check, account.remoteId)
+        if (remaining.some((entry) => entry.remoteId === remoteId)) throw error
+      }
       const result = await this.db.call('favoriteCloudFolderDelete', { accountId, folderId })
       this.changed()
       return result
+    })
+  }
+  /**
+   * Reads the live cloud folder list and aligns the local list with it:
+   * cloud-deleted folders are removed when nothing local depends on them, and
+   * otherwise become local-only folders (their works stay; writeback recreates
+   * the cloud folder). Returns the reconciled local list for the renderer.
+   */
+  async reconcileFolders(accountId: string): Promise<{
+    folders: FavoriteFolder[]
+    removed: number
+    unlinked: number
+  }> {
+    return this.run(accountId, async (check) => {
+      const account = await this.identity(accountId, check)
+      if (!account.remoteId) throw new AppError('AUTH_REQUIRED', '请先登录并核验抖音账号。')
+      const live = await this.folders(accountId, check, account.remoteId)
+      const liveRemoteIds = [...new Set(live.flatMap((folder) => (folder.remoteId ? [folder.remoteId] : [])))]
+      const result = await this.db.call('favoriteFoldersReconcile', { accountId, liveRemoteIds })
+      if (result.removed || result.unlinked) this.changed()
+      return {
+        removed: result.removed,
+        unlinked: result.unlinked,
+        folders: (await this.db.call('favoriteFolders', { accountId })) as FavoriteFolder[]
+      }
     })
   }
   async removeFromFolder(
@@ -1333,15 +1386,29 @@ export class FavoriteActions {
             remoteFolder = existing
             outcome = 'already-existed'
           } else {
-            const response = await request(() =>
-              this.engine.request(accountId, 'favoriteFolderCreate', {
-                action: '1',
-                collects_name: operation.title!,
-                secret: operation.private ? '1' : '0'
-              })
-            )
-            parseWriteResult(response)
-            remoteFolder = { ...parseFavoriteFolder(response.collects_info), localCount: 0 }
+            const create = () =>
+              request(() =>
+                this.engine.request(accountId, 'favoriteFolderCreate', {
+                  action: '1',
+                  collects_name: operation.title!,
+                  secret: operation.private ? '1' : '0'
+                })
+              )
+            try {
+              const response = await create()
+              parseWriteResult(response)
+              remoteFolder = { ...parseFavoriteFolder(response.collects_info), localCount: 0 }
+            } catch (error) {
+              // A rejected or unanswered create may still have taken effect, or
+              // the platform may reject a duplicate that already exists. Let a
+              // fresh listing decide before reporting failure.
+              if (!(error instanceof AppError) || !unconfirmedWrite(error.code)) throw error
+              const after = await this.folders(accountId, check, account.remoteId ?? '', request)
+              const created = after.find((folder) => !folder.localOnly && folder.title === operation.title)
+              if (!created) throw error
+              remoteFolder = created
+              outcome = 'already-existed'
+            }
           }
           await this.db.call('favoriteLinkFolder', {
             accountId,
@@ -1507,18 +1574,123 @@ export class FavoriteActions {
         }
       }
       if (unconfirmed.length) {
-        this.syncPlan = null
-        const first = unconfirmed[0]!
-        const diagnostic = unconfirmed
-          .map((operation) => `${operation.folderId ?? ''}:${operation.workId ?? ''}`)
-          .join(',')
-        throw new AppError(
-          'WRITE_UNCONFIRMED',
-          `云端接口接受了写回请求，但刷新后仍有 ${unconfirmed.length} 个作品未出现在收藏夹列表；队列已保留。folderId=${first.folderId ?? ''} workId=${first.workId ?? ''}`,
-          undefined,
-          undefined,
-          `未确认项目 folderId:workId=${diagnostic}`
-        )
+        // A single work the platform silently drops must not stall the whole
+        // queue. Explicitly unavailable works are skipped; every other item
+        // gets one more add attempt. Items still missing after that are
+        // skipped and reported, while the local folder membership stays so a
+        // later writeback's cloud reconciliation can try again.
+        const pending = new Map(unconfirmed.map((operation) => [operation.id, operation]))
+        const skip = async (operation: (typeof unconfirmed)[number], reason: string) => {
+          await this.db.call('favoriteWriteComplete', { accountId, operationId: operation.id })
+          skipped++
+          skippedItems.push({
+            workId: operation.workId!,
+            kind: operation.kind,
+            reason
+          })
+          pending.delete(operation.id)
+        }
+        const retried: (typeof unconfirmed)[number][] = []
+        for (const operation of unconfirmed) {
+          const folder = currentLocalFolders.find((entry) => entry.id === operation.folderId)
+          if (!folder?.remoteId || !operation.workId) continue
+          // The web folder API takes 2 for videos. Image galleries carry
+          // aweme_type 68 and are silently dropped when sent as 2, so retry
+          // them with their own type.
+          let itemType = '2'
+          try {
+            const state = parseFavoriteState(
+              await request(() => this.engine.request(accountId, 'detail', { aweme_id: operation.workId! })),
+              operation.workId!
+            )
+            if (state.work.mediaType === 'gallery') itemType = state.type || '68'
+          } catch (error) {
+            const code = error instanceof AppError ? error.code : ''
+            if (code !== 'CONTENT_UNAVAILABLE' && code !== 'WORK_UNAVAILABLE') throw error
+            await skip(operation, error instanceof Error ? error.message : String(error))
+            continue
+          }
+          await new Promise<void>((resolve) => setTimeout(resolve, WRITEBACK_WRITE_INTERVAL_MS))
+          try {
+            parseWriteResult(
+              await request(() =>
+                this.engine.request(accountId, 'favoriteFolderAdd', {
+                  aweme_id: operation.workId!,
+                  item_ids: operation.workId!,
+                  item_type: itemType,
+                  to_collects_id: folder.remoteId!,
+                  collects_name: folder.title,
+                  update_collects_sort: 'true'
+                })
+              )
+            )
+            retried.push(operation)
+          } catch (error) {
+            const code = error instanceof AppError ? error.code : ''
+            if (code !== 'CONTENT_UNAVAILABLE' && code !== 'WORK_UNAVAILABLE') throw error
+            await skip(operation, error instanceof Error ? error.message : String(error))
+          }
+        }
+        if (retried.length) {
+          const refreshedCloudFolders = await this.folders(accountId, check, account.remoteId, request)
+          for (const folderId of new Set(retried.map((operation) => operation.folderId))) {
+            const folder = currentLocalFolders.find((entry) => entry.id === folderId)
+            const cloudFolder = refreshedCloudFolders.find(
+              (entry) => entry.remoteId === (folder?.remoteId ?? folderId)
+            )
+            if (!folder?.remoteId || !cloudFolder)
+              throw new AppError('FOLDER_CHANGED', '写回后无法核实目标云端收藏夹，待写回操作已保留。')
+            await this.db.call('favoriteFolderSetRemoteCount', {
+              accountId,
+              accountRemoteId: account.remoteId,
+              folderId: folder.id,
+              folderRemoteId: folder.remoteId,
+              remoteCount: cloudFolder.remoteCount
+            })
+            const remoteWorkIds = await this.remoteFolderWorkIds(
+              accountId,
+              folder.remoteId,
+              cloudFolder.remoteCount,
+              check,
+              request
+            )
+            for (const operation of retried.filter((entry) => entry.folderId === folderId)) {
+              if (!operation.workId || !pending.has(operation.id)) continue
+              if (!remoteWorkIds.has(operation.workId)) {
+                await skip(
+                  operation,
+                  '平台接受写回但刷新后仍未出现在收藏夹；已跳过（本机关联保留，下次写回会再核对）。'
+                )
+                continue
+              }
+              await this.db.call('favoriteWriteComplete', { accountId, operationId: operation.id })
+              completedItems.push({
+                kind: operation.kind,
+                folderId: operation.folderId,
+                workId: operation.workId,
+                title: operation.title,
+                outcome: 'visible-after-retry'
+              })
+              synced++
+              pending.delete(operation.id)
+            }
+          }
+        }
+        if (pending.size) {
+          this.syncPlan = null
+          const remaining = [...pending.values()]
+          const first = remaining[0]!
+          const diagnostic = remaining
+            .map((operation) => `${operation.folderId ?? ''}:${operation.workId ?? ''}`)
+            .join(',')
+          throw new AppError(
+            'WRITE_UNCONFIRMED',
+            `云端接口接受了写回请求，但刷新后仍有 ${remaining.length} 个作品未出现在收藏夹列表；队列已保留。folderId=${first.folderId ?? ''} workId=${first.workId ?? ''}`,
+            undefined,
+            undefined,
+            `未确认项目 folderId:workId=${diagnostic}`
+          )
+        }
       }
     }
     const remaining = await this.db.call('favoriteWritePending', { accountId })

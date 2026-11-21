@@ -9,7 +9,11 @@ export type ResponseContext = { operation?: Operation; workId?: string; action?:
 const riskCodes = new Set(['8', '2154', '2156', '10000', '10001'])
 const envelopeKeys = new Set(['status_code', 'status_msg', 'message', 'extra', 'log_pb', 'logid', 'log_id'])
 export const contentRead = (operation?: Operation) =>
-  operation === 'likes' || operation === 'detail' || commentRead(operation) || collectionRead(operation)
+  operation === 'likes' ||
+  operation === 'detail' ||
+  operation === 'danmaku' ||
+  commentRead(operation) ||
+  collectionRead(operation)
 export const commentRead = (operation?: Operation) =>
   operation === 'comments' || operation === 'commentReplies'
 export function bareEnvelope(data: Payload, operation?: Operation): boolean {

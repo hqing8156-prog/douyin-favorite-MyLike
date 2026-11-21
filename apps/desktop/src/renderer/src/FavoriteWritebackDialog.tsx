@@ -284,10 +284,21 @@ export function FavoriteWritebackDialog({
   useEffect(() => {
     if (pending?.items.length) setDetailsOpen(true)
   }, [pending])
-  const changedFolders = folders.filter(
-    (folder) =>
-      folder.localOnly || folder.localCount !== folder.remoteCount || (folder.pendingWrites ?? 0) > 0
-  )
+  // The picker reads a cached list; sort here as well so the writeback scope
+  // always follows folder names regardless of how the list was refreshed.
+  // AI-generated folders are grouped at the end so hand-made folders stay on top.
+  const aiFolder = (title: string) => /^ai/i.test(title.trim())
+  const changedFolders = folders
+    .filter(
+      (folder) =>
+        folder.localOnly || folder.localCount !== folder.remoteCount || (folder.pendingWrites ?? 0) > 0
+    )
+    .sort((a, b) => {
+      const aiA = aiFolder(a.title),
+        aiB = aiFolder(b.title)
+      if (aiA !== aiB) return aiA ? 1 : -1
+      return a.title.localeCompare(b.title, 'zh-CN')
+    })
   const visibleSelected = selectedFolders.filter((id) => changedFolders.some((folder) => folder.id === id))
   const selectedCount = visibleSelected.length + Number(includeDefault)
 
@@ -378,7 +389,7 @@ export function FavoriteWritebackDialog({
       notice?.(
         [
           `写回完成：已写回 ${result.synced} 项`,
-          result.skipped ? `跳过 ${result.skipped} 项不可见作品` : '',
+          result.skipped ? `跳过 ${result.skipped} 项不可见或未确认作品` : '',
           result.truncated ? `本次达到单次上限 ${WRITEBACK_BATCH_LIMIT} 项` : '',
           result.remaining ? `仍有 ${result.remaining} 项待写回。` : '队列已清空。'
         ]
@@ -416,6 +427,7 @@ export function FavoriteWritebackDialog({
           项本地改动待写回。只显示本地与云端数量不一致或仍有待写回改动的收藏夹；云端数量为最近一次同步结果。
           点收藏夹右侧的“差异”可只读核对具体作品，不会修改云端或加入写回。
           只处理下方所选范围，未选择的改动会保留。已同步收藏夹会核对作品，并将本地有、云端缺少的作品加入写回；这项核对本身不会删除云端作品。
+          标记为“仅本机”的收藏夹写回时会重新创建云端收藏夹，并把本地作品写进去。
           写回只把本机新增内容写到云端，不会把云端的新增或删除带回本机；要获取云端变化请使用“同步收藏夹”。必要的默认收藏状态会一并写回。
         </p>
         <div className="favorite-writeback-selection">
